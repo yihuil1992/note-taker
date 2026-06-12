@@ -1,6 +1,6 @@
 [package]
 name = "note-taker"
-version = "0.2.3"
+version = "0.2.4"
 description = "Windows-first AI meeting transcription assistant"
 authors = ["yihui"]
 edition = "2021"
