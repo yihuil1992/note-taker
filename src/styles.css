@@ -24,6 +24,7 @@
   --primary-ink: #02040a;
   --danger: #f08a8a;
   --warn: #d8bd82;
+  --ready: #aad7dc;
   --shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
   --radius-sm: 2px;
   --radius-md: 4px;
@@ -49,6 +50,7 @@
   --primary-ink: #f7f8f3;
   --danger: #b75b5b;
   --warn: #917647;
+  --ready: #477c86;
   --shadow: 0 12px 26px rgba(36, 48, 64, 0.1);
 }
 
@@ -1170,6 +1172,90 @@ code {
   color: var(--muted);
   font-size: 13px;
   font-weight: 680;
+}
+
+.openai-key-field {
+  gap: 6px;
+}
+
+.secret-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px 34px;
+  gap: 6px;
+  align-items: center;
+}
+
+.secret-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(2, 4, 10, 0.42);
+}
+
+.secret-input-wrap svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.secret-input-wrap input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--ink);
+  background: transparent;
+  font-size: 12px;
+}
+
+.secret-input-wrap input::placeholder {
+  color: var(--muted-faint);
+}
+
+.secret-input-wrap:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(170, 215, 220, 0.2);
+}
+
+.icon-action {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink-soft);
+  background: rgba(2, 4, 10, 0.52);
+}
+
+.icon-action:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  background: rgba(16, 24, 39, 0.62);
+}
+
+.icon-action:disabled {
+  cursor: not-allowed;
+  color: var(--muted-faint);
+  opacity: 0.7;
+}
+
+.secret-status {
+  color: var(--muted-faint);
+  font-size: 11px;
+  font-weight: 560;
+  line-height: 1.35;
+}
+
+.secret-status.ready {
+  color: var(--ready);
+}
+
+.secret-status.warn {
+  color: var(--warn);
 }
 
 .compact-field {
@@ -2358,6 +2444,40 @@ code {
 :root[data-atlas-mode="archive"] .atlas-shell .secondary-action,
 :root[data-atlas-mode="archive"] .theme-toggle {
   background: rgba(255, 255, 252, 0.76);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap,
+:root[data-atlas-mode="archive"] .atlas-shell .icon-action {
+  border-color: rgba(71, 124, 134, 0.24);
+  color: var(--ink-soft);
+  background: rgba(255, 255, 252, 0.82);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap svg {
+  color: var(--accent);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap input {
+  color: var(--ink);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap input::placeholder {
+  color: #596675;
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap:focus-within {
+  border-color: rgba(71, 124, 134, 0.58);
+  box-shadow: 0 0 0 2px rgba(71, 124, 134, 0.16);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .icon-action:hover:not(:disabled) {
+  border-color: rgba(71, 124, 134, 0.42);
+  background: rgba(237, 240, 234, 0.9);
+}
+
+:root[data-atlas-mode="archive"] .atlas-shell .icon-action:disabled {
+  color: #7a8796;
+  background: rgba(237, 240, 234, 0.74);
 }
 
 :root[data-atlas-mode="archive"] .atlas-shell .atlas-select-trigger:hover,

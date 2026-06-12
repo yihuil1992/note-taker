@@ -1,6 +1,6 @@
 # Note Taker
 
-Windows-first, local-first meeting capture and transcription app.
+Windows-first meeting capture and transcription app with local transcription by default.
 
 Note Taker records microphone and computer audio on Windows, stores meeting records in a local SQLite database, transcribes with a local Whisper-compatible sidecar by default, summarizes with Codex CLI, and exports Markdown or JSON notes.
 
@@ -20,7 +20,7 @@ Mobile layout:
 
 ## Current Status
 
-Phase 1 is a working local-first MVP.
+Phase 1 is a working local-by-default MVP.
 
 Implemented:
 
@@ -31,7 +31,7 @@ Implemented:
 - Smart transcription windows built from short persisted capture chunks.
 - SQLite storage for meetings, audio chunks, transcript segments, summaries, settings, and search.
 - Local Whisper-compatible sidecar transcription.
-- Optional OpenAI Speech-to-Text provider when `OPENAI_API_KEY` is available.
+- Optional OpenAI Speech-to-Text provider with a key from Windows Credential Manager or `OPENAI_API_KEY`.
 - Codex CLI structured summaries from transcript segments.
 - Local search over title, summary, action items, topics, and transcript text.
 - Markdown and JSON export to the app-data `exports/` directory.
@@ -97,7 +97,7 @@ src-tauri/target/release/bundle/
 6. Select the meeting, run Transcribe or Re-transcribe, then Summarize.
 7. Search prior meetings, archive unwanted records, or export the selected meeting as Markdown/JSON.
 
-Local Whisper stays on device. The OpenAI provider uploads audio chunks and must be explicitly selected.
+Local Whisper stays on device. The OpenAI provider uploads audio chunks and must be explicitly selected. If OpenAI transcription fails for a window, the app falls back to local `large-v3-turbo` for that window.
 
 ## Local AI Sidecar
 
@@ -166,7 +166,9 @@ pnpm transcribe:smoke target\audio-spike\microphone.wav target\sidecar-smoke
 
 ## Optional OpenAI Transcription
 
-To use OpenAI Speech-to-Text, set `OPENAI_API_KEY` before launching the app or running the CLI, then choose `OpenAI API speech-to-text` in Settings.
+To use OpenAI Speech-to-Text in the desktop app, choose `OpenAI API speech-to-text` in Settings, paste your OpenAI API key into the OpenAI API key field, and save it. The key is stored in Windows Credential Manager and is not written to SQLite. If an OpenAI window fails because of API, quota, rate, or key errors, that window falls back to the local whisper.cpp `large-v3-turbo` model.
+
+For development commands, you can still set `OPENAI_API_KEY` before launching the app or running the CLI. Environment variables take precedence over the stored key.
 
 ```powershell
 $env:OPENAI_API_KEY="your-openai-api-key"
@@ -217,9 +219,9 @@ The updater signing private key is stored outside the repository. GitHub Actions
 
 ## Privacy Defaults
 
-- Meeting data is local-first.
+- Meeting audio and transcript data stay local by default.
 - Raw audio retention defaults to 7 days.
 - Local Whisper transcription stays on device.
-- Cloud transcription providers are opt-in.
-- Provider secrets should use the OS credential store in a future UI.
+- OpenAI transcription is opt-in and sends selected audio windows to OpenAI.
+- Provider secrets use the OS credential store.
 - Codex auth tokens must not be stored by this app.

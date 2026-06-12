@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod exports;
 pub mod meeting;
+pub mod openai_credentials;
 pub mod openai_transcription;
 pub mod process;
 pub mod rechunk;
@@ -18,6 +19,9 @@ use exports::{export_meeting_json, export_meeting_markdown, ExportResult};
 use meeting::{
     record_chunked_demo, retranscribe_meeting_chunks, transcribe_meeting_chunks,
     ChunkedMeetingResult, MeetingTranscriptionResult,
+};
+use openai_credentials::{
+    clear_api_key, get_status as get_api_key_status, save_api_key, OpenAiApiKeyStatus,
 };
 use recording::{ActiveRecordingStatus, RecordingManager, RecordingStopResult};
 use serde::Serialize;
@@ -408,6 +412,21 @@ fn update_app_setting(
 }
 
 #[tauri::command]
+fn get_openai_api_key_status() -> Result<OpenAiApiKeyStatus, String> {
+    get_api_key_status().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_openai_api_key(api_key: String) -> Result<OpenAiApiKeyStatus, String> {
+    save_api_key(&api_key).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clear_openai_api_key() -> Result<OpenAiApiKeyStatus, String> {
+    clear_api_key().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn download_default_transcription_model(
     app: tauri::AppHandle,
 ) -> Result<ModelDownloadResult, String> {
@@ -661,6 +680,9 @@ pub fn run() {
             export_meeting_as_json,
             get_app_settings,
             update_app_setting,
+            get_openai_api_key_status,
+            save_openai_api_key,
+            clear_openai_api_key,
             download_default_transcription_model,
             download_default_sidecar_runtime,
             run_sidecar_transcription_smoke,

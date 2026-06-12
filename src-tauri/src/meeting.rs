@@ -1,10 +1,10 @@
 use crate::audio::{capture_spike, CaptureArtifact};
 use crate::storage::{
-    find_transcript_segment_for_chunk, finish_meeting, get_app_settings, initialize_database,
-    insert_audio_chunk, insert_audio_source, insert_meeting, insert_transcript_segment,
-    list_audio_chunks_for_meeting, reset_meeting_transcription,
+    finish_meeting, get_app_settings, initialize_database, insert_audio_chunk, insert_audio_source,
+    insert_meeting, insert_transcript_segment, list_audio_chunks_for_meeting,
+    list_transcript_segments_for_meeting, reset_meeting_transcription,
     update_audio_chunk_transcription_status, update_meeting_status, NewAudioChunk, NewAudioSource,
-    NewMeeting, NewTranscriptSegment,
+    NewMeeting, NewTranscriptSegment, TranscriptSegmentRecord,
 };
 use crate::task_control::CancellationToken;
 use chrono::{DateTime, Local, Utc};
@@ -12,6 +12,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
+
+const OPENAI_FALLBACK_LOCAL_MODEL: &str = "large-v3-turbo";
 
 #[derive(Debug, Error)]
 pub enum MeetingError {
@@ -25,6 +27,13 @@ pub enum MeetingError {
     Sidecar(#[from] crate::sidecar::SidecarError),
     #[error("OpenAI transcription error: {0}")]
     OpenAiTranscription(#[from] crate::openai_transcription::OpenAiTranscriptionError),
+    #[error(
+        "OpenAI transcription failed ({openai_error}); local fallback failed ({fallback_error})"
+    )]
+    OpenAiFallbackFailed {
+        openai_error: String,
+        fallback_error: String,
+    },
     #[error("Smart chunk error: {0}")]
     SmartChunk(#[from] crate::smart_chunks::SmartChunkError),
     #[error("Task control error: {0}")]
@@ -257,7 +266,7 @@ pub fn transcribe_meeting_chunks(
             &settings.custom_glossary,
             cancellation,
         ) {
-            Ok(Some(segment)) => {
+            Ok(segment_batch) if !segment_batch.is_empty() => {
                 processed_windows += 1;
                 update_progress(
                     cancellation,
@@ -270,9 +279,9 @@ pub fn transcribe_meeting_chunks(
                     processed_windows as u32,
                     Some(windows.len() as u32),
                 )?;
-                segments.push(segment);
+                segments.extend(segment_batch);
             }
-            Ok(None) => {
+            Ok(_) => {
                 processed_windows += 1;
                 empty_chunks += 1;
                 update_progress(
@@ -392,31 +401,29 @@ fn transcribe_one_window(
     language_hint: &str,
     custom_glossary: &str,
     cancellation: Option<&CancellationToken>,
-) -> Result<Option<TranscriptSegmentResult>, MeetingError> {
+) -> Result<Vec<TranscriptSegmentResult>, MeetingError> {
     if is_cancelled(cancellation) {
         return Err(MeetingError::Cancelled);
     }
     let end_ms = window.started_at_ms + window.duration_ms;
-    if let Some(existing) = find_transcript_segment_for_chunk(
-        database_path,
-        &window.meeting_id,
-        &window.source_kind,
-        window.started_at_ms,
-        end_ms,
-    )? {
+    let existing = existing_segments_for_window(database_path, window, end_ms)?;
+    if !existing.is_empty() {
         update_window_chunk_status(database_path, window, "transcribed", None)?;
-        return Ok(Some(TranscriptSegmentResult {
-            id: existing.id,
-            chunk_id: window.id.clone(),
-            source_kind: existing.source_kind,
-            speaker_label: existing.speaker_label,
-            language: existing.language,
-            start_ms: existing.start_ms,
-            end_ms: existing.end_ms,
-            text: existing.text,
-            provider: existing.provider,
-            output_json_path: String::new(),
-        }));
+        return Ok(existing
+            .into_iter()
+            .map(|existing| TranscriptSegmentResult {
+                id: existing.id,
+                chunk_id: window.id.clone(),
+                source_kind: existing.source_kind,
+                speaker_label: existing.speaker_label,
+                language: existing.language,
+                start_ms: existing.start_ms,
+                end_ms: existing.end_ms,
+                text: existing.text,
+                provider: existing.provider,
+                output_json_path: String::new(),
+            })
+            .collect());
     }
 
     let output = match transcription_provider {
@@ -424,31 +431,49 @@ fn transcribe_one_window(
             if is_cancelled(cancellation) {
                 return Err(MeetingError::Cancelled);
             }
-            TranscriptionOutput::from_openai(crate::openai_transcription::transcribe_audio_file(
+            match crate::openai_transcription::transcribe_audio_file(
                 transcriptions_dir,
                 Path::new(&window.path),
                 openai_model,
                 language_hint,
                 custom_glossary,
-            )?)
+            ) {
+                Ok(output) => TranscriptionOutput::from_openai(output),
+                Err(openai_error) => {
+                    if is_cancelled(cancellation) {
+                        return Err(MeetingError::Cancelled);
+                    }
+                    transcribe_with_local_whisper(
+                        sidecar_dir,
+                        models_dir,
+                        transcriptions_dir,
+                        Path::new(&window.path),
+                        language_hint,
+                        OPENAI_FALLBACK_LOCAL_MODEL,
+                        custom_glossary,
+                        cancellation,
+                    )
+                    .map(|output| output.with_provider(openai_fallback_provider(openai_model)))
+                    .map_err(|fallback_error| match fallback_error {
+                        MeetingError::Cancelled => MeetingError::Cancelled,
+                        other => MeetingError::OpenAiFallbackFailed {
+                            openai_error: openai_error.to_string(),
+                            fallback_error: other.to_string(),
+                        },
+                    })?
+                }
+            }
         }
-        _ => {
-            let output = crate::sidecar::transcribe_smoke_with_language_model_glossary_and_cancel(
-                sidecar_dir,
-                models_dir,
-                transcriptions_dir,
-                Path::new(&window.path),
-                language_hint,
-                local_model,
-                custom_glossary,
-                cancellation,
-            )
-            .map_err(|error| match error {
-                crate::sidecar::SidecarError::Cancelled => MeetingError::Cancelled,
-                other => MeetingError::Sidecar(other),
-            })?;
-            TranscriptionOutput::from_sidecar(output)
-        }
+        _ => transcribe_with_local_whisper(
+            sidecar_dir,
+            models_dir,
+            transcriptions_dir,
+            Path::new(&window.path),
+            language_hint,
+            local_model,
+            custom_glossary,
+            cancellation,
+        )?,
     };
     if is_cancelled(cancellation) {
         return Err(MeetingError::Cancelled);
@@ -460,40 +485,100 @@ fn transcribe_one_window(
     let text = normalized_text.trim();
     if text.is_empty() || is_likely_non_speech_hallucination(text) {
         update_window_chunk_status(database_path, window, "transcribed_empty", None)?;
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let segment_id = uuid::Uuid::new_v4().to_string();
     let speaker_label = speaker_label_for_source(&window.source_kind);
-    insert_transcript_segment(
-        database_path,
-        &NewTranscriptSegment {
-            id: &segment_id,
-            meeting_id: &window.meeting_id,
-            source_kind: &window.source_kind,
-            speaker_label,
-            language: "auto",
-            start_ms: window.started_at_ms,
-            end_ms,
-            text,
-            confidence: None,
-            provider: &output.provider,
-        },
-    )?;
+    let drafts = split_transcription_output(window, &output, language_hint);
+    let mut inserted = Vec::new();
+    for draft in drafts {
+        let text = draft.text.trim();
+        if text.is_empty() || is_likely_non_speech_hallucination(text) {
+            continue;
+        }
+        let segment_id = uuid::Uuid::new_v4().to_string();
+        insert_transcript_segment(
+            database_path,
+            &NewTranscriptSegment {
+                id: &segment_id,
+                meeting_id: &window.meeting_id,
+                source_kind: &window.source_kind,
+                speaker_label,
+                language: "auto",
+                start_ms: draft.start_ms,
+                end_ms: draft.end_ms,
+                text,
+                confidence: None,
+                provider: &output.provider,
+            },
+        )?;
+        inserted.push(TranscriptSegmentResult {
+            id: segment_id,
+            chunk_id: window.id.clone(),
+            source_kind: window.source_kind.clone(),
+            speaker_label: speaker_label.to_string(),
+            language: "auto".to_string(),
+            start_ms: draft.start_ms,
+            end_ms: draft.end_ms,
+            text: text.to_string(),
+            provider: output.provider.clone(),
+            output_json_path: output.output_json_path.clone(),
+        });
+    }
+    if inserted.is_empty() {
+        update_window_chunk_status(database_path, window, "transcribed_empty", None)?;
+        return Ok(Vec::new());
+    }
     update_window_chunk_status(database_path, window, "transcribed", None)?;
 
-    Ok(Some(TranscriptSegmentResult {
-        id: segment_id,
-        chunk_id: window.id.clone(),
-        source_kind: window.source_kind.clone(),
-        speaker_label: speaker_label.to_string(),
-        language: "auto".to_string(),
-        start_ms: window.started_at_ms,
-        end_ms,
-        text: text.to_string(),
-        provider: output.provider,
-        output_json_path: output.output_json_path,
-    }))
+    Ok(inserted)
+}
+
+fn transcribe_with_local_whisper(
+    sidecar_dir: &Path,
+    models_dir: &Path,
+    transcriptions_dir: &Path,
+    input_path: &Path,
+    language_hint: &str,
+    model_id: &str,
+    custom_glossary: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<TranscriptionOutput, MeetingError> {
+    let output = crate::sidecar::transcribe_smoke_with_language_model_glossary_and_cancel(
+        sidecar_dir,
+        models_dir,
+        transcriptions_dir,
+        input_path,
+        language_hint,
+        model_id,
+        custom_glossary,
+        cancellation,
+    )
+    .map_err(|error| match error {
+        crate::sidecar::SidecarError::Cancelled => MeetingError::Cancelled,
+        other => MeetingError::Sidecar(other),
+    })?;
+    Ok(TranscriptionOutput::from_sidecar(output))
+}
+
+fn openai_fallback_provider(openai_model: &str) -> String {
+    format!("openai-api:{openai_model} fallback:local-whisper:{OPENAI_FALLBACK_LOCAL_MODEL}")
+}
+
+fn existing_segments_for_window(
+    database_path: &Path,
+    window: &crate::smart_chunks::TranscriptionWindow,
+    window_end_ms: i64,
+) -> Result<Vec<TranscriptSegmentRecord>, MeetingError> {
+    let existing = list_transcript_segments_for_meeting(database_path, &window.meeting_id)?
+        .into_iter()
+        .filter(|segment| {
+            segment.source_kind == window.source_kind
+                && segment.start_ms >= window.started_at_ms
+                && segment.end_ms <= window_end_ms
+        })
+        .collect::<Vec<_>>();
+    Ok(existing)
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
@@ -535,6 +620,7 @@ fn update_window_chunk_status(
 struct TranscriptionOutput {
     provider: String,
     transcript_text: String,
+    transcript_parts: Vec<ProviderTranscriptPart>,
     output_json_path: String,
 }
 
@@ -543,6 +629,15 @@ impl TranscriptionOutput {
         Self {
             provider: "local-whisper".to_string(),
             transcript_text: output.transcript_text,
+            transcript_parts: output
+                .transcript_parts
+                .into_iter()
+                .map(|part| ProviderTranscriptPart {
+                    start_ms: part.start_ms,
+                    end_ms: part.end_ms,
+                    text: part.text,
+                })
+                .collect(),
             output_json_path: output.output_json_path,
         }
     }
@@ -551,9 +646,174 @@ impl TranscriptionOutput {
         Self {
             provider: format!("openai-api:{}", output.model),
             transcript_text: output.transcript_text,
+            transcript_parts: Vec::new(),
             output_json_path: output.output_json_path,
         }
     }
+
+    fn with_provider(mut self, provider: String) -> Self {
+        self.provider = provider;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTranscriptPart {
+    start_ms: i64,
+    end_ms: i64,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentDraft {
+    start_ms: i64,
+    end_ms: i64,
+    text: String,
+}
+
+fn split_transcription_output(
+    window: &crate::smart_chunks::TranscriptionWindow,
+    output: &TranscriptionOutput,
+    language_hint: &str,
+) -> Vec<SegmentDraft> {
+    let parts = if output.transcript_parts.is_empty() {
+        vec![ProviderTranscriptPart {
+            start_ms: 0,
+            end_ms: window.duration_ms,
+            text: output.transcript_text.clone(),
+        }]
+    } else {
+        output.transcript_parts.clone()
+    };
+
+    let mut drafts = Vec::new();
+    for part in parts {
+        let normalized =
+            crate::text_normalization::normalize_transcript_text(language_hint, &part.text);
+        let text = normalized.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let start_ms = window.started_at_ms + part.start_ms.clamp(0, window.duration_ms);
+        let end_ms = window.started_at_ms + part.end_ms.clamp(0, window.duration_ms);
+        if end_ms <= start_ms {
+            continue;
+        }
+        drafts.extend(split_text_part(start_ms, end_ms, text));
+    }
+    drafts
+}
+
+fn split_text_part(start_ms: i64, end_ms: i64, text: &str) -> Vec<SegmentDraft> {
+    const MAX_DISPLAY_SEGMENT_MS: i64 = 8_000;
+
+    let sentence_parts = split_sentences(text);
+    let total_chars = sentence_parts
+        .iter()
+        .map(|part| part.chars().count().max(1))
+        .sum::<usize>()
+        .max(1);
+    let duration_ms = end_ms - start_ms;
+    let mut cursor = start_ms;
+    let mut drafts = Vec::new();
+
+    for (index, sentence) in sentence_parts.iter().enumerate() {
+        let chars = sentence.chars().count().max(1);
+        let mut sentence_end = if index + 1 == sentence_parts.len() {
+            end_ms
+        } else {
+            cursor + ((duration_ms as i128 * chars as i128) / total_chars as i128) as i64
+        };
+        if sentence_end <= cursor {
+            sentence_end = (cursor + 1).min(end_ms);
+        }
+        drafts.extend(split_long_sentence(
+            cursor,
+            sentence_end,
+            sentence,
+            MAX_DISPLAY_SEGMENT_MS,
+        ));
+        cursor = sentence_end;
+    }
+
+    drafts
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for character in text.chars() {
+        current.push(character);
+        if matches!(
+            character,
+            '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';' | '\n'
+        ) {
+            push_sentence(&mut sentences, &mut current);
+        }
+    }
+    push_sentence(&mut sentences, &mut current);
+    if sentences.is_empty() {
+        vec![text.trim().to_string()]
+    } else {
+        sentences
+    }
+}
+
+fn push_sentence(sentences: &mut Vec<String>, current: &mut String) {
+    let sentence = current.trim();
+    if !sentence.is_empty() {
+        sentences.push(sentence.to_string());
+    }
+    current.clear();
+}
+
+fn split_long_sentence(
+    start_ms: i64,
+    end_ms: i64,
+    text: &str,
+    max_segment_ms: i64,
+) -> Vec<SegmentDraft> {
+    let duration_ms = end_ms - start_ms;
+    if duration_ms <= max_segment_ms {
+        return vec![SegmentDraft {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+        }];
+    }
+
+    let parts = ((duration_ms + max_segment_ms - 1) / max_segment_ms).max(1) as usize;
+    let chars = text.chars().collect::<Vec<_>>();
+    let chars_per_part = (chars.len() + parts - 1) / parts;
+    let mut drafts = Vec::new();
+    let mut cursor = start_ms;
+    for index in 0..parts {
+        let char_start = index * chars_per_part;
+        if char_start >= chars.len() {
+            break;
+        }
+        let char_end = ((index + 1) * chars_per_part).min(chars.len());
+        let segment_text = chars[char_start..char_end]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if segment_text.is_empty() {
+            continue;
+        }
+        let segment_end = if index + 1 == parts {
+            end_ms
+        } else {
+            start_ms + ((duration_ms as i128 * (index + 1) as i128) / parts as i128) as i64
+        };
+        drafts.push(SegmentDraft {
+            start_ms: cursor,
+            end_ms: segment_end.max(cursor + 1),
+            text: segment_text,
+        });
+        cursor = segment_end;
+    }
+    drafts
 }
 
 fn speaker_label_for_source(source_kind: &str) -> &'static str {
@@ -642,4 +902,89 @@ pub(crate) fn persist_source_and_chunk(
         error: artifact.error.clone(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_window() -> crate::smart_chunks::TranscriptionWindow {
+        crate::smart_chunks::TranscriptionWindow {
+            id: "meeting-a:microphone:1000-21000".to_string(),
+            meeting_id: "meeting-a".to_string(),
+            source_kind: "microphone".to_string(),
+            chunk_ids: vec!["chunk-a".to_string()],
+            started_at_ms: 1_000,
+            duration_ms: 20_000,
+            path: "window.wav".to_string(),
+        }
+    }
+
+    #[test]
+    fn splits_timestamped_transcription_parts_into_sentence_segments() {
+        let output = TranscriptionOutput {
+            provider: "local-whisper".to_string(),
+            transcript_text: "第一句。第二句？".to_string(),
+            transcript_parts: vec![ProviderTranscriptPart {
+                start_ms: 2_000,
+                end_ms: 8_000,
+                text: "第一句。第二句？".to_string(),
+            }],
+            output_json_path: "out.json".to_string(),
+        };
+
+        let segments = split_transcription_output(&test_window(), &output, "zh");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].start_ms, 3_000);
+        assert_eq!(segments[1].end_ms, 9_000);
+        assert_eq!(segments[0].text, "第一句。");
+        assert_eq!(segments[1].text, "第二句？");
+    }
+
+    #[test]
+    fn splits_long_unpunctuated_output_for_display() {
+        let output = TranscriptionOutput {
+            provider: "local-whisper".to_string(),
+            transcript_text: "这是一个很长很长没有标点的测试文本用来模拟连续口语输出".to_string(),
+            transcript_parts: vec![ProviderTranscriptPart {
+                start_ms: 0,
+                end_ms: 20_000,
+                text: "这是一个很长很长没有标点的测试文本用来模拟连续口语输出".to_string(),
+            }],
+            output_json_path: "out.json".to_string(),
+        };
+
+        let segments = split_transcription_output(&test_window(), &output, "zh");
+
+        assert!(segments.len() >= 3);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.end_ms - segment.start_ms <= 8_000));
+        assert_eq!(
+            segments.first().map(|segment| segment.start_ms),
+            Some(1_000)
+        );
+        assert_eq!(segments.last().map(|segment| segment.end_ms), Some(21_000));
+    }
+
+    #[test]
+    fn openai_fallback_provider_marks_fixed_local_model() {
+        assert_eq!(
+            openai_fallback_provider("gpt-4o-transcribe"),
+            "openai-api:gpt-4o-transcribe fallback:local-whisper:large-v3-turbo"
+        );
+    }
+
+    #[test]
+    fn openai_fallback_failure_reports_both_causes() {
+        let error = MeetingError::OpenAiFallbackFailed {
+            openai_error: "OpenAI transcription failed with status 429: quota exceeded".to_string(),
+            fallback_error: "Sidecar transcription error: large-v3-turbo is missing".to_string(),
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("quota exceeded"));
+        assert!(message.contains("large-v3-turbo is missing"));
+    }
 }

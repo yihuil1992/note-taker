@@ -135,8 +135,17 @@ pub struct TranscriptionSmokeResult {
     pub output_json_path: String,
     pub output_prefix: String,
     pub transcript_text: String,
+    pub transcript_parts: Vec<TranscriptPart>,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptPart {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
 }
 
 pub fn get_status(sidecar_dir: &Path, models_dir: &Path) -> Result<SidecarStatus, SidecarError> {
@@ -326,10 +335,10 @@ pub fn transcribe_smoke_with_language_model_glossary_and_cancel(
     }
 
     let output_json_path = output_prefix.with_extension("json");
-    let transcript_text = if output_json_path.exists() {
-        extract_transcript_text(&fs::read_to_string(&output_json_path)?)?
+    let (transcript_text, transcript_parts) = if output_json_path.exists() {
+        extract_transcript_output(&fs::read_to_string(&output_json_path)?)?
     } else {
-        stdout.trim().to_string()
+        (stdout.trim().to_string(), Vec::new())
     };
 
     Ok(TranscriptionSmokeResult {
@@ -337,6 +346,7 @@ pub fn transcribe_smoke_with_language_model_glossary_and_cancel(
         output_json_path: output_json_path.display().to_string(),
         output_prefix: output_prefix.display().to_string(),
         transcript_text,
+        transcript_parts,
         stdout,
         stderr,
     })
@@ -674,15 +684,61 @@ fn copy_runtime_dir_files(
     Ok(installed_files)
 }
 
-fn extract_transcript_text(raw_json: &str) -> Result<String, SidecarError> {
+fn extract_transcript_output(
+    raw_json: &str,
+) -> Result<(String, Vec<TranscriptPart>), SidecarError> {
     let value: serde_json::Value = serde_json::from_str(raw_json)?;
+    let parts = extract_transcript_parts(&value);
+    if !parts.is_empty() {
+        let text = parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok((text, parts));
+    }
+
     let mut parts = Vec::new();
     collect_text_fields(&value, &mut parts);
-    Ok(parts
+    let text = parts
         .join(" ")
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" "))
+        .join(" ");
+    Ok((text, Vec::new()))
+}
+
+fn extract_transcript_parts(value: &serde_json::Value) -> Vec<TranscriptPart> {
+    let Some(items) = value
+        .get("transcription")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("text")?.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let offsets = item.get("offsets")?;
+            let start_ms = offsets.get("from")?.as_i64()?;
+            let end_ms = offsets.get("to")?.as_i64()?;
+            if end_ms <= start_ms {
+                return None;
+            }
+            Some(TranscriptPart {
+                start_ms,
+                end_ms,
+                text: text.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn collect_text_fields(value: &serde_json::Value, parts: &mut Vec<String>) {
@@ -741,12 +797,31 @@ mod tests {
           "segments": [{"text": "world"}, {"tokens": [{"text": "again"}]}]
         }"#;
 
-        let text = extract_transcript_text(raw_json).expect("extract transcript text");
+        let (text, parts) = extract_transcript_output(raw_json).expect("extract transcript text");
 
+        assert!(parts.is_empty());
         assert!(text.contains("hello"));
         assert!(text.contains("world"));
         assert!(text.contains("again"));
         assert!(!text.contains("  "));
+    }
+
+    #[test]
+    fn extract_transcript_output_keeps_whisper_offsets() {
+        let raw_json = r#"{
+          "transcription": [
+            {"offsets": {"from": 0, "to": 2200}, "text": " hello "},
+            {"offsets": {"from": 2300, "to": 5900}, "text": "world"}
+          ]
+        }"#;
+
+        let (text, parts) = extract_transcript_output(raw_json).expect("extract transcript output");
+
+        assert_eq!(text, "hello world");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].start_ms, 0);
+        assert_eq!(parts[0].end_ms, 2200);
+        assert_eq!(parts[0].text, "hello");
     }
 
     #[test]

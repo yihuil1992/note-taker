@@ -14,6 +14,7 @@ import {
   FileText,
   Filter,
   FolderOpen,
+  KeyRound,
   Mic,
   MonitorSpeaker,
   Moon,
@@ -301,6 +302,11 @@ type AppUpdateProgress = {
   phase: "downloading" | "installing" | "restarting";
 };
 
+type OpenAiApiKeyStatus = {
+  hasKey: boolean;
+  source: string;
+};
+
 type ActiveRecordingStatus = {
   meetingId: string;
   title: string;
@@ -415,6 +421,8 @@ function App() {
   const [updateProgress, setUpdateProgress] = React.useState<AppUpdateProgress | null>(null);
   const [glossaryEntries, setGlossaryEntries] = React.useState<GlossaryEntry[]>(() => parseGlossaryEntries(defaultSettings.customGlossary));
   const [expandedGlossaryEntryId, setExpandedGlossaryEntryId] = React.useState<string | null>(null);
+  const [openaiApiKeyStatus, setOpenaiApiKeyStatus] = React.useState<OpenAiApiKeyStatus | null>(null);
+  const [openaiApiKeyDraft, setOpenaiApiKeyDraft] = React.useState("");
   const glossaryDraft = React.useMemo(() => serializeGlossaryEntries(glossaryEntries), [glossaryEntries]);
   const savedGlossaryDraft = React.useMemo(() => serializeGlossaryEntries(parseGlossaryEntries(settings.customGlossary)), [settings.customGlossary]);
   const glossaryEntryCount = glossaryEntries.filter((entry) => entry.term.trim() || entry.description.trim()).length;
@@ -468,13 +476,14 @@ function App() {
   async function refreshAll(activeMeetingId = selectedMeetingId) {
     setError(null);
     try {
-      const [nextStatus, nextDevices, nextSettings, nextMeetings, nextRecording, nextTaskStatuses] = await Promise.all([
+      const [nextStatus, nextDevices, nextSettings, nextMeetings, nextRecording, nextTaskStatuses, nextOpenAiKeyStatus] = await Promise.all([
         callBackend<AppStatus>("get_app_status"),
         callBackend<AudioDevice[]>("list_audio_devices"),
         callBackend<AppSettings>("get_app_settings"),
         callBackend<MeetingListItem[]>("list_meetings", { limit: 80 }),
         callBackend<ActiveRecordingStatus | null>("get_active_recording"),
-        callBackend<MeetingTaskStatus[]>("list_meeting_task_statuses")
+        callBackend<MeetingTaskStatus[]>("list_meeting_task_statuses"),
+        callBackend<OpenAiApiKeyStatus>("get_openai_api_key_status")
       ]);
       setStatus(nextStatus);
       setDevices(nextDevices);
@@ -482,6 +491,7 @@ function App() {
       setMeetings(nextMeetings);
       setActiveRecording(nextRecording);
       setTaskStatuses(indexTaskStatuses(nextTaskStatuses));
+      setOpenaiApiKeyStatus(nextOpenAiKeyStatus);
       if (activeMeetingId) {
         setSelectedMeetingId(activeMeetingId);
         await loadDetail(activeMeetingId);
@@ -746,6 +756,38 @@ function App() {
     setNotice("Glossary saved for transcription and summaries.");
   }
 
+  async function saveOpenAiApiKey() {
+    setBusy("openai-key");
+    setError(null);
+    try {
+      const status = await callBackend<OpenAiApiKeyStatus>("save_openai_api_key", {
+        apiKey: openaiApiKeyDraft
+      });
+      setOpenaiApiKeyStatus(status);
+      setOpenaiApiKeyDraft("");
+      setNotice("OpenAI API key saved to Windows Credential Manager.");
+    } catch (keyError) {
+      setError(String(keyError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function clearOpenAiApiKey() {
+    setBusy("openai-key");
+    setError(null);
+    try {
+      const status = await callBackend<OpenAiApiKeyStatus>("clear_openai_api_key");
+      setOpenaiApiKeyStatus(status);
+      setOpenaiApiKeyDraft("");
+      setNotice(status.hasKey ? "Environment OpenAI API key is still active." : "Stored OpenAI API key cleared.");
+    } catch (keyError) {
+      setError(String(keyError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   function addGlossaryEntry() {
     const entry = createBlankGlossaryEntry();
     setGlossaryEntries((entries) => [...entries, entry]);
@@ -881,7 +923,7 @@ function App() {
           <span className="brand-mark"><Activity size={20} aria-hidden="true" /></span>
           <span>
             <strong>Note Taker</strong>
-            <small>Local meeting memory</small>
+            <small>Meeting memory</small>
           </span>
         </a>
         <nav className="atlas-nav" aria-label="Primary navigation">
@@ -891,7 +933,7 @@ function App() {
         </nav>
         <div className="atlas-header-status">
           <span className={setupReady ? "status-dot ready" : "status-dot"} />
-          <span>{settings.transcriptionProvider === "openai-api" ? "Cloud STT selected" : setupReady ? "Local stack ready" : "Setup needed"}</span>
+          <span>{settings.transcriptionProvider === "openai-api" ? "Cloud transcription selected" : setupReady ? "Local stack ready" : "Setup needed"}</span>
           <button
             className="theme-toggle"
             type="button"
@@ -935,7 +977,7 @@ function App() {
           </div>
           <div className="meeting-list">
             {meetings.length === 0 ? (
-              <EmptyState title="No meetings yet" text="Record a meeting to create searchable local notes." />
+              <EmptyState title="No meetings yet" text="Record a meeting to create searchable notes." />
             ) : (
               meetings.map((meeting) => {
                 const taskStatus = taskStatuses[meeting.id];
@@ -1002,6 +1044,7 @@ function App() {
             consentRequired={!settings.recordingConsentReminderDismissed && !consentAccepted}
             inputDevice={inputDevice}
             outputDevice={outputDevice}
+            cloudTranscriptionSelected={settings.transcriptionProvider === "openai-api"}
             onRecord={() => void startRecording(false)}
             onStop={() => void stopRecording()}
             onConsentRecord={() => void dismissConsentAndRecord()}
@@ -1061,7 +1104,11 @@ function App() {
             <DataRow label="Local Whisper" value={status?.sidecar.executableExists ? "Runtime installed" : "Runtime missing"} tone={status?.sidecar.executableExists ? "ready" : "warn"} />
             <DataRow label="Model" value={status?.sidecar.model.verified ? `${status.sidecar.model.id} verified` : `${settings.localTranscriptionModel} missing`} tone={status?.sidecar.model.verified ? "ready" : "warn"} />
             <DataRow label="Codex" value={`${settings.summaryProvider} · ${settings.summaryModel}`} tone="ready" />
-            <DataRow label="OpenAI STT" value={settings.transcriptionProvider === "openai-api" ? settings.openaiTranscriptionModel : "Optional"} />
+            <DataRow
+              label="OpenAI transcription"
+              value={openaiApiKeyStatus?.hasKey ? `${settings.openaiTranscriptionModel} key ready` : settings.transcriptionProvider === "openai-api" ? `${settings.openaiTranscriptionModel} needs key` : "Optional"}
+              tone={openaiApiKeyStatus?.hasKey ? "ready" : settings.transcriptionProvider === "openai-api" ? "warn" : undefined}
+            />
             <button className="secondary-action sidecar-folder-action" type="button" onClick={() => void callBackend<void>("open_sidecar_folder")} aria-label="Open sidecar folder">
               <FolderOpen size={16} aria-hidden="true" />
               Open folder
@@ -1101,6 +1148,52 @@ function App() {
                 disabled={settings.transcriptionProvider !== "openai-api"}
                 onChange={(value) => void updateSetting("openai_transcription_model", value)}
               />
+            </div>
+            <div className="field openai-key-field">
+              <span>OpenAI API key</span>
+              <div className="secret-input-row">
+                <div className="secret-input-wrap">
+                  <KeyRound size={14} aria-hidden="true" />
+                  <input
+                    type="password"
+                    value={openaiApiKeyDraft}
+                    placeholder={openaiApiKeyStatus?.hasKey ? "Stored in Windows Credential Manager" : "Paste API key"}
+                    autoComplete="off"
+                    spellCheck={false}
+                    onChange={(event) => setOpenaiApiKeyDraft(event.target.value)}
+                    aria-label="OpenAI API key"
+                  />
+                </div>
+                <button
+                  className="icon-action"
+                  type="button"
+                  onClick={() => void saveOpenAiApiKey()}
+                  disabled={busy === "openai-key" || !openaiApiKeyDraft.trim()}
+                  aria-label="Save OpenAI API key"
+                  title="Save OpenAI API key"
+                  data-tooltip="Save key"
+                >
+                  <CheckCircle2 size={16} aria-hidden="true" />
+                </button>
+                <button
+                  className="icon-action"
+                  type="button"
+                  onClick={() => void clearOpenAiApiKey()}
+                  disabled={busy === "openai-key" || !openaiApiKeyStatus?.hasKey}
+                  aria-label="Clear OpenAI API key"
+                  title="Clear OpenAI API key"
+                  data-tooltip="Clear key"
+                >
+                  <Trash2 size={16} aria-hidden="true" />
+                </button>
+              </div>
+              <small className={openaiApiKeyStatus?.hasKey ? "secret-status ready" : "secret-status warn"}>
+                {openaiApiKeyStatus?.hasKey
+                  ? openaiApiKeyStatus.source === "environment"
+                    ? "Using OPENAI_API_KEY from this process."
+                    : "Stored securely in Windows Credential Manager."
+                  : "Required only when OpenAI API speech-to-text is selected."}
+              </small>
             </div>
             <div className="field">
               <span>Transcription language</span>
@@ -1218,9 +1311,9 @@ function App() {
 
       <footer className="atlas-footer">
         <span className="privacy-dot" />
-        <strong>Local only</strong>
+        <strong>{settings.transcriptionProvider === "openai-api" ? "Cloud transcription on" : "Local by default"}</strong>
         <span className="version-pill">v{status?.appVersion ?? "0.2.1"}</span>
-        <span>{settings.transcriptionProvider === "openai-api" ? "Cloud speech-to-text selected" : "All meeting data stays on this device by default"}</span>
+        <span>{settings.transcriptionProvider === "openai-api" ? "Audio windows are sent to OpenAI for transcription." : "Audio and transcripts stay on this device unless you choose cloud transcription."}</span>
         <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
           <RefreshCw size={14} aria-hidden="true" />
           {updateCheckStatus === "checking" ? "Checking" : updateCheck?.latestVersion ? `Latest ${updateCheck.latestVersion}` : "Check updates"}
@@ -1238,6 +1331,7 @@ function RecordingPanel({
   consentRequired,
   inputDevice,
   outputDevice,
+  cloudTranscriptionSelected,
   onRecord,
   onStop,
   onConsentRecord,
@@ -1249,6 +1343,7 @@ function RecordingPanel({
   consentRequired: boolean;
   inputDevice?: AudioDevice;
   outputDevice?: AudioDevice;
+  cloudTranscriptionSelected: boolean;
   onRecord: () => void;
   onStop: () => void;
   onConsentRecord: () => void;
@@ -1272,7 +1367,11 @@ function RecordingPanel({
           {activeRecording ? (busy === "stopping" ? "Stopping..." : "Stop recording") : busy === "recording" ? "Starting..." : "Start recording"}
           <ChevronDown size={17} aria-hidden="true" />
         </button>
-        <p>Recordings are saved locally and never leave this device unless you choose a cloud provider.</p>
+        <p>
+          {cloudTranscriptionSelected
+            ? "Recording files are saved locally. Transcription sends audio windows to OpenAI."
+            : "Recording files and transcription stay on this device unless you choose cloud transcription."}
+        </p>
         <div className="field compact-field">
           <span>Capture chunks</span>
           <AtlasSelect value={String(chunkSeconds)} options={CHUNK_SECONDS_OPTIONS} onChange={(value) => onChunkSecondsChange(Number(value))} />
@@ -1289,7 +1388,11 @@ function RecordingPanel({
       {consentRequired ? (
         <div className="consent-box">
           <ShieldCheck size={18} aria-hidden="true" />
-          <p>Confirm that your meeting participants understand this session may be recorded and transcribed locally.</p>
+          <p>
+            {cloudTranscriptionSelected
+              ? "Confirm that participants understand this session may be recorded and sent to OpenAI for transcription."
+              : "Confirm that participants understand this session may be recorded and transcribed locally."}
+          </p>
           <button type="button" onClick={onConsentRecord}>I have consent, record</button>
         </div>
       ) : null}
@@ -2057,6 +2160,7 @@ async function callBackend<T>(command: string, args?: Record<string, unknown>): 
 let mockRuntimeInstalled = true;
 let mockModelVerified = true;
 let mockSettings: AppSettings = { ...defaultSettings, recordingConsentReminderDismissed: true };
+let mockOpenAiApiKeyStatus: OpenAiApiKeyStatus = { hasKey: false, source: "credential-manager" };
 let mockActiveRecording: ActiveRecordingStatus | null = null;
 let mockTaskStatuses: Record<string, MeetingTaskStatus> = {};
 let mockMeetings: MeetingListItem[] = [
@@ -2106,6 +2210,17 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
     } as T;
   }
   if (command === "get_app_settings") return mockSettings as T;
+  if (command === "get_openai_api_key_status") return mockOpenAiApiKeyStatus as T;
+  if (command === "save_openai_api_key") {
+    const apiKey = String(args?.apiKey ?? "").trim();
+    if (!apiKey) throw new Error("OpenAI API key is empty.");
+    mockOpenAiApiKeyStatus = { hasKey: true, source: "credential-manager" };
+    return mockOpenAiApiKeyStatus as T;
+  }
+  if (command === "clear_openai_api_key") {
+    mockOpenAiApiKeyStatus = { hasKey: false, source: "credential-manager" };
+    return mockOpenAiApiKeyStatus as T;
+  }
   if (command === "get_active_recording") return mockActiveRecording as T;
   if (command === "list_meeting_task_statuses") return Object.values(mockTaskStatuses) as T;
   if (command === "get_meeting_task_status") {
@@ -2277,7 +2392,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       language: "zh-CN",
       overview: detail.summary.overview,
       topics: parseStringArray(detail.summary.topicsJson),
-      decisions: [{ text: "Keep the local-first sidecar transcription path.", evidence: null }],
+      decisions: [{ text: "Keep local Whisper as the fallback transcription path.", evidence: null }],
       actionItems: [{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }],
       openQuestions: [],
       summaryOutline: parseSummaryOutline(detail.summary.rawJson),
@@ -2477,7 +2592,7 @@ function makeSummary(id: string): MeetingSummaryRecord {
     language: "zh-CN",
     overview: "本次会议验证了本地录音、分段转录、Codex 总结和导出流程。可推断的负责人和截止日期保持为空，避免臆造。",
     topics: ["Local recording", "Whisper transcription", "Codex summary"],
-    decisions: [{ text: "Keep the local-first sidecar transcription path.", evidence: null }],
+    decisions: [{ text: "Keep local Whisper as the fallback transcription path.", evidence: null }],
     actionItems: [{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }],
     openQuestions: [],
     summaryOutline: [
@@ -2545,7 +2660,7 @@ function makeSummary(id: string): MeetingSummaryRecord {
     language: "zh-CN",
     overview: "本次会议验证了本地录音、分段转录、Codex 总结和导出流程。可推断的负责人和截止日期保持为空，避免臆造。",
     topicsJson: JSON.stringify(["Local recording", "Whisper transcription", "Codex summary"]),
-    decisionsJson: JSON.stringify([{ text: "Keep the local-first sidecar transcription path.", evidence: null }]),
+    decisionsJson: JSON.stringify([{ text: "Keep local Whisper as the fallback transcription path.", evidence: null }]),
     actionItemsJson: JSON.stringify([{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }]),
     risksOrQuestionsJson: JSON.stringify([]),
     rawJson: JSON.stringify(rawSummary),
