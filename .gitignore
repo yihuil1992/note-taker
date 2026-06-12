@@ -1,0 +1,14 @@
+AGENTS.md
+agent-docs/
+.impeccable/
+output/
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+.agent-vite*.log
+*.local
+.env
+.env.*
+!.env.example

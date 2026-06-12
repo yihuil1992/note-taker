@@ -1,0 +1,76 @@
+[package]
+name = "note-taker"
+version = "0.1.0"
+description = "Windows-first AI meeting transcription assistant"
+authors = ["yihui"]
+edition = "2021"
+
+[lib]
+name = "note_taker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "note-taker"
+path = "src/main.rs"
+
+[[bin]]
+name = "audio-spike"
+path = "src/bin/audio_spike.rs"
+
+[[bin]]
+name = "meeting-demo"
+path = "src/bin/meeting_demo.rs"
+
+[[bin]]
+name = "meeting-transcribe"
+path = "src/bin/meeting_transcribe.rs"
+
+[[bin]]
+name = "meeting-summarize"
+path = "src/bin/meeting_summarize.rs"
+
+[[bin]]
+name = "meeting-rechunk"
+path = "src/bin/meeting_rechunk.rs"
+
+[[bin]]
+name = "meeting-windows"
+path = "src/bin/meeting_windows.rs"
+
+[[bin]]
+name = "transcribe-smoke"
+path = "src/bin/transcribe_smoke.rs"
+
+[[bin]]
+name = "sidecar-runtime"
+path = "src/bin/sidecar_runtime.rs"
+
+[[bin]]
+name = "sidecar-model"
+path = "src/bin/sidecar_model.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0.4", features = [] }
+
+[dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
+cpal = "0.15.3"
+ferrous-opencc = { version = "0.4.0", default-features = false, features = ["t2s-conversion"] }
+hound = "3.5.1"
+reqwest = { version = "0.12.12", features = ["blocking", "json", "multipart", "rustls-tls"], default-features = false }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+sha2 = "0.10.8"
+tauri = { version = "2.1.1", features = [] }
+thiserror = "2.0.3"
+uuid = { version = "1.11.0", features = ["v4"] }
+windows = { version = "0.58.0", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_KernelStreaming",
+  "Win32_System_Com",
+  "Win32_System_Memory",
+  "Win32_System_Threading"
+] }
+zip = "2.2.2"

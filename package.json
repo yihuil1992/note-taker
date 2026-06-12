@@ -1,0 +1,38 @@
+{
+  "name": "note-taker",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 1420",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "typecheck": "tsc --noEmit",
+    "audio:spike": "cargo run --manifest-path src-tauri/Cargo.toml --bin audio-spike --",
+    "meeting:demo": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-demo --",
+    "meeting:summarize": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-summarize --",
+    "meeting:transcribe": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-transcribe --",
+    "meeting:rechunk": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-rechunk --",
+    "meeting:windows": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-windows --",
+    "sidecar:model": "cargo run --manifest-path src-tauri/Cargo.toml --bin sidecar-model --",
+    "sidecar:runtime": "cargo run --manifest-path src-tauri/Cargo.toml --bin sidecar-runtime --",
+    "transcribe:smoke": "cargo run --manifest-path src-tauri/Cargo.toml --bin transcribe-smoke --"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.2.0",
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.60.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3"
+  }
+}
