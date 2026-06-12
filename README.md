@@ -199,8 +199,21 @@ GitHub Actions is configured for a Windows-first pipeline.
 - `CI` installs pnpm/Node/Rust, then runs frontend typecheck, frontend build, Rust check, and Rust tests.
 - `Release` runs manually from the Actions tab or when pushing a `v*` tag.
 - `Release` runs `pnpm tauri build` on `windows-2022` and uploads the standalone executable plus MSI/NSIS installers as workflow artifacts.
+- Tag builds such as `v0.2.0` also create or update a GitHub Release with those Windows artifacts.
 
 The release workflow does not sign binaries yet. Treat uploaded installers as unsigned development artifacts until a signing certificate is configured.
+
+## Automatic Updates
+
+On startup, the app checks the signed Tauri updater manifest at the latest public GitHub Release for `yihuil1992/note-taker`.
+
+- If a newer signed updater bundle is available, the app shows an update notice with an `Update and restart` action.
+- Clicking `Update and restart` downloads the signed updater bundle, installs it through Tauri's updater, and relaunches the app.
+- If GitHub is unavailable, the updater manifest is missing, or no signed update is available, the app stays quiet and continues normally.
+- Release notes links are restricted to this repository's GitHub release URLs before they are opened.
+- This is an in-app signed bundle update, not a binary-diff incremental patch. Windows installers are still not code-signed, so SmartScreen may still warn on direct installer downloads.
+
+The updater signing private key is stored outside the repository. GitHub Actions expects the `TAURI_SIGNING_PRIVATE_KEY` secret when publishing tagged releases.
 
 ## Privacy Defaults
 

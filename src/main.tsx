@@ -9,6 +9,7 @@ import {
   Clock3,
   Database,
   Download,
+  ExternalLink,
   FileJson,
   FileText,
   Filter,
@@ -219,6 +220,23 @@ type ExportResult = {
   bytes: number;
 };
 
+type AppUpdateCheck = {
+  currentVersion: string;
+  latestVersion?: string | null;
+  updateAvailable: boolean;
+  installable?: boolean;
+  releaseName?: string | null;
+  releaseUrl?: string | null;
+  publishedAt?: string | null;
+  notes?: string | null;
+};
+
+type AppUpdateProgress = {
+  downloadedBytes: number;
+  contentLength?: number;
+  phase: "downloading" | "installing" | "restarting";
+};
+
 type ActiveRecordingStatus = {
   meetingId: string;
   title: string;
@@ -320,9 +338,14 @@ function App() {
   const [exportResult, setExportResult] = React.useState<ExportResult | null>(null);
   const [consentAccepted, setConsentAccepted] = React.useState(false);
   const [activeRecording, setActiveRecording] = React.useState<ActiveRecordingStatus | null>(null);
+  const [updateCheck, setUpdateCheck] = React.useState<AppUpdateCheck | null>(null);
+  const [updateCheckStatus, setUpdateCheckStatus] = React.useState<"idle" | "checking" | "failed">("idle");
+  const [updateProgress, setUpdateProgress] = React.useState<AppUpdateProgress | null>(null);
+  const pendingUpdateRef = React.useRef<unknown>(null);
 
   React.useEffect(() => {
     void refreshAll();
+    void checkForUpdates(true);
   }, []);
 
   React.useEffect(() => {
@@ -576,6 +599,109 @@ function App() {
     await refreshAll();
   }
 
+  async function checkForUpdates(silent = false) {
+    setUpdateCheckStatus("checking");
+    try {
+      const result = window.__TAURI_INTERNALS__
+        ? await checkTauriUpdater()
+        : await callBackend<AppUpdateCheck>("check_for_app_update");
+      setUpdateCheck(result);
+      setUpdateCheckStatus("idle");
+      if (!silent && !result.updateAvailable) {
+        setNotice(`Note Taker ${result.currentVersion} is up to date.`);
+      }
+    } catch {
+      setUpdateCheckStatus("failed");
+      if (!silent) {
+        setNotice("Could not check GitHub releases right now.");
+      }
+    }
+  }
+
+  async function checkTauriUpdater(): Promise<AppUpdateCheck> {
+    const { getVersion } = await import("@tauri-apps/api/app");
+    const { check } = await import("@tauri-apps/plugin-updater");
+    const currentVersion = await getVersion();
+    const update = await check();
+    pendingUpdateRef.current = update;
+    if (!update) {
+      return {
+        currentVersion,
+        latestVersion: null,
+        updateAvailable: false,
+        installable: false
+      };
+    }
+    return {
+      currentVersion: update.currentVersion,
+      latestVersion: update.version,
+      updateAvailable: true,
+      installable: true,
+      releaseName: `Note Taker ${update.version}`,
+      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/latest",
+      publishedAt: update.date ?? null,
+      notes: update.body ?? null
+    };
+  }
+
+  async function installAvailableUpdate() {
+    if (!updateCheck?.updateAvailable) return;
+    setBusy("install-update");
+    setError(null);
+    setUpdateProgress({ downloadedBytes: 0, phase: "downloading" });
+    try {
+      if (!window.__TAURI_INTERNALS__) {
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+        setUpdateProgress({ downloadedBytes: 1, contentLength: 1, phase: "restarting" });
+        setNotice("Preview mode simulated the signed updater install flow.");
+        return;
+      }
+
+      const update = pendingUpdateRef.current as {
+        downloadAndInstall: (handler: (event: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>;
+      } | null;
+      if (!update) {
+        throw new Error("No signed update is ready to install. Check again first.");
+      }
+
+      let downloadedBytes = 0;
+      let contentLength: number | undefined;
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          contentLength = event.data?.contentLength;
+          downloadedBytes = 0;
+          setUpdateProgress({ downloadedBytes, contentLength, phase: "downloading" });
+        } else if (event.event === "Progress") {
+          downloadedBytes += event.data?.chunkLength ?? 0;
+          setUpdateProgress({ downloadedBytes, contentLength, phase: "downloading" });
+        } else if (event.event === "Finished") {
+          setUpdateProgress({ downloadedBytes, contentLength, phase: "installing" });
+        }
+      });
+
+      setUpdateProgress({ downloadedBytes, contentLength, phase: "restarting" });
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (installError) {
+      setError(String(installError));
+      setUpdateProgress(null);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function openUpdateRelease() {
+    if (!updateCheck?.releaseUrl) return;
+    setBusy("open-release");
+    try {
+      await callBackend<void>("open_url", { url: updateCheck.releaseUrl });
+    } catch (openError) {
+      setError(String(openError));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   const inputDevice = devices.find((device) => device.kind === "input" && device.isDefault) ?? devices.find((device) => device.kind === "input");
   const outputDevice = devices.find((device) => device.kind === "output" && device.isDefault) ?? devices.find((device) => device.kind === "output");
   const setupReady = settings.transcriptionProvider === "openai-api" || Boolean(status?.sidecar.ready);
@@ -666,6 +792,15 @@ function App() {
           <div className="atlas-notices">
             {error ? <div className="error-banner">{error}</div> : null}
             {notice ? <div className="notice-banner">{notice}</div> : null}
+            {updateCheck?.updateAvailable ? (
+              <UpdateNotice
+                update={updateCheck}
+                busy={busy === "install-update" || busy === "open-release"}
+                progress={updateProgress}
+                onInstall={() => void installAvailableUpdate()}
+                onOpenRelease={() => void openUpdateRelease()}
+              />
+            ) : null}
           </div>
 
           <RecordingPanel
@@ -789,6 +924,10 @@ function App() {
         <span className="privacy-dot" />
         <strong>Local only</strong>
         <span>{settings.transcriptionProvider === "openai-api" ? "Cloud speech-to-text selected" : "All meeting data stays on this device by default"}</span>
+        <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
+          <RefreshCw size={14} aria-hidden="true" />
+          {updateCheckStatus === "checking" ? "Checking" : updateCheck?.latestVersion ? `Latest ${updateCheck.latestVersion}` : "Check updates"}
+        </button>
         <code>{status?.appDataDir ?? "Initializing app data"}</code>
       </footer>
     </main>
@@ -858,6 +997,68 @@ function RecordingPanel({
         </div>
       ) : null}
 
+    </section>
+  );
+}
+
+function UpdateNotice({
+  update,
+  busy,
+  progress,
+  onInstall,
+  onOpenRelease
+}: {
+  update: AppUpdateCheck;
+  busy: boolean;
+  progress: AppUpdateProgress | null;
+  onInstall: () => void;
+  onOpenRelease: () => void;
+}) {
+  const releaseLabel = update.releaseName ?? update.latestVersion ?? "New release";
+  const progressPercent = progress?.contentLength
+    ? Math.min(100, Math.round((progress.downloadedBytes / progress.contentLength) * 100))
+    : progress
+      ? 12
+      : 0;
+  const actionLabel = progress?.phase === "installing"
+    ? "Installing"
+    : progress?.phase === "restarting"
+      ? "Restarting"
+      : busy
+        ? "Downloading"
+        : update.installable
+          ? "Update and restart"
+          : "Open release";
+  return (
+    <section className="update-notice" aria-label="Application update available">
+      <div className="update-notice-mark">
+        <Download size={18} aria-hidden="true" />
+      </div>
+      <div className="update-notice-copy">
+        <p className="section-label">Update available</p>
+        <h3>{releaseLabel}</h3>
+        <p>
+          Current {update.currentVersion}
+          {update.latestVersion ? ` · Latest ${update.latestVersion}` : ""}
+          {update.publishedAt ? ` · ${formatDateTime(update.publishedAt)}` : ""}
+        </p>
+        {update.notes ? <small>{update.notes}</small> : null}
+        {progress ? (
+          <div className="update-progress" aria-label={`Update ${progress.phase}`}>
+            <span style={{ width: `${progressPercent}%` }} />
+          </div>
+        ) : null}
+      </div>
+      <button className="secondary-action" type="button" onClick={update.installable ? onInstall : onOpenRelease} disabled={busy}>
+        {update.installable ? <Download size={16} aria-hidden="true" /> : <ExternalLink size={16} aria-hidden="true" />}
+        {actionLabel}
+      </button>
+      {update.installable && update.releaseUrl ? (
+        <button className="ghost-action update-release-link" type="button" onClick={onOpenRelease} disabled={busy}>
+          <ExternalLink size={14} aria-hidden="true" />
+          Release notes
+        </button>
+      ) : null}
     </section>
   );
 }
@@ -1464,7 +1665,19 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
     mockModelVerified = true;
     return { downloaded: true, model: mockSidecar(true, mockRuntimeInstalled).model } as T;
   }
-  if (command === "open_sidecar_folder" || command === "open_exports_folder") return undefined as T;
+  if (command === "check_for_app_update") {
+    return {
+      currentVersion: "0.1.0",
+      latestVersion: "v0.2.0",
+      updateAvailable: true,
+      installable: true,
+      releaseName: "Note Taker v0.2.0",
+      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.0",
+      publishedAt: "2026-06-12T12:00:00Z",
+      notes: "Startup update checks now surface the latest GitHub release without interrupting local recording work."
+    } as T;
+  }
+  if (command === "open_sidecar_folder" || command === "open_exports_folder" || command === "open_url") return undefined as T;
   throw new Error(`Unsupported mock command: ${command}`);
 }
 
