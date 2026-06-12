@@ -10,6 +10,7 @@ pub mod smart_chunks;
 pub mod storage;
 pub mod summary;
 pub mod text_normalization;
+pub mod updates;
 
 use audio::{capture_spike, list_devices, AudioDevice, SpikeResult};
 use exports::{export_meeting_json, export_meeting_markdown, ExportResult};
@@ -29,12 +30,13 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use storage::{
     archive_meeting as archive_meeting_record, get_app_settings as load_app_settings,
-    get_meeting_detail as load_meeting_detail,
-    initialize_database, list_recent_meetings, search_meetings as search_meeting_records,
-    set_app_setting, AppSettingsRecord, MeetingDetailRecord, MeetingListItem,
+    get_meeting_detail as load_meeting_detail, initialize_database, list_recent_meetings,
+    search_meetings as search_meeting_records, set_app_setting, AppSettingsRecord,
+    MeetingDetailRecord, MeetingListItem,
 };
 use summary::{summarize_meeting_with_codex, MeetingSummaryResult};
 use tauri::Manager;
+use updates::{check_latest_release, AppUpdateCheck};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -385,6 +387,22 @@ fn check_sidecar_runtime(app: tauri::AppHandle) -> Result<SidecarRuntimeCheck, S
     check_runtime(&paths.sidecar_dir).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+async fn check_for_app_update() -> Result<AppUpdateCheck, String> {
+    tauri::async_runtime::spawn_blocking(|| check_latest_release(env!("CARGO_PKG_VERSION")))
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !is_trusted_github_release_url(&url) {
+        return Err("Refusing to open an untrusted update URL.".to_string());
+    }
+    open_external_url(&url)
+}
+
 struct AppPaths {
     app_data_dir: PathBuf,
     database_path: PathBuf,
@@ -486,9 +504,46 @@ fn open_folder(path: &PathBuf) -> Result<(), String> {
     }
 }
 
+fn is_trusted_github_release_url(url: &str) -> bool {
+    url.starts_with("https://github.com/yihuil1992/note-taker/releases/")
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = ProcessCommand::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        process::suppress_console_window(&mut command);
+        command
+            .spawn()
+            .map_err(|error| format!("Failed to open update page: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        ProcessCommand::new("open")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("Failed to open update page: {error}"))?;
+        return Ok(());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        ProcessCommand::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map_err(|error| format!("Failed to open update page: {error}"))?;
+        Ok(())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RecordingManager::default())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
@@ -514,7 +569,9 @@ pub fn run() {
             run_sidecar_transcription_smoke,
             open_sidecar_folder,
             open_exports_folder,
-            check_sidecar_runtime
+            check_sidecar_runtime,
+            check_for_app_update,
+            open_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Note Taker");

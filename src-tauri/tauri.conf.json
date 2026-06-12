@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Note Taker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.yihui.notetaker",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -25,7 +25,19 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": ["icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYyMEMyNzk3QTJFRjhFQjcKUldTM2p1K2lseWNNOG5zUnEwRTBENUN3RVZlZjNBOXZld2JuWFBJVXpNMU9JVGQ5eGVzd0w3eFIK",
+      "endpoints": [
+        "https://github.com/yihuil1992/note-taker/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
