@@ -191,6 +191,17 @@ cargo test --manifest-path src-tauri/Cargo.toml
 pnpm tauri build
 ```
 
+## CI/CD
+
+GitHub Actions is configured for a Windows-first pipeline.
+
+- `CI` runs on pushes and pull requests to `main`.
+- `CI` installs pnpm/Node/Rust, then runs frontend typecheck, frontend build, Rust check, and Rust tests.
+- `Release` runs manually from the Actions tab or when pushing a `v*` tag.
+- `Release` runs `pnpm tauri build` on `windows-latest` and uploads the standalone executable plus MSI/NSIS installers as workflow artifacts.
+
+The release workflow does not sign binaries yet. Treat uploaded installers as unsigned development artifacts until a signing certificate is configured.
+
 ## Privacy Defaults
 
 - Meeting data is local-first.
