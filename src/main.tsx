@@ -55,6 +55,7 @@ type AppSettings = {
   rawAudioRetentionDays: number;
   transcriptionProvider: string;
   summaryProvider: string;
+  summaryModel: string;
   localTranscriptionModel: string;
   openaiTranscriptionModel: string;
   languageHint: string;
@@ -210,7 +211,43 @@ type MeetingSummaryResult = {
   decisions: Array<{ text: string; evidence?: string | null }>;
   actionItems: Array<{ task: string; owner?: string | null; dueDate?: string | null; evidence?: string | null }>;
   openQuestions: Array<{ text: string; evidence?: string | null }>;
+  summaryOutline: SummaryOutlineSection[];
+  structuredNotes: StructuredSummaryNote[];
+  detailedNotes: DetailedSummaryNote[];
   rawJson: string;
+};
+
+type SummaryOutlineSection = {
+  title: string;
+  summary: string;
+  items: SummaryOutlineItem[];
+};
+
+type SummaryOutlineItem = {
+  title: string;
+  summary: string;
+  detail: string;
+  evidence?: string | null;
+  decisions: string[];
+  actionItems: string[];
+  openQuestions: string[];
+};
+
+type DetailedSummaryNote = {
+  title: string;
+  detail: string;
+  evidence?: string | null;
+};
+
+type StructuredSummaryNote = {
+  title: string;
+  category: string;
+  summary: string;
+  detail: string;
+  evidence?: string | null;
+  decisions: string[];
+  actionItems: string[];
+  openQuestions: string[];
 };
 
 type ExportResult = {
@@ -268,6 +305,7 @@ const defaultSettings: AppSettings = {
   rawAudioRetentionDays: 7,
   transcriptionProvider: "local-whisper",
   summaryProvider: "codex-cli",
+  summaryModel: "gpt-5.4",
   localTranscriptionModel: "large-v3-turbo",
   openaiTranscriptionModel: "gpt-4o-mini-transcribe",
   languageHint: "zh",
@@ -295,6 +333,11 @@ const OPENAI_TRANSCRIPTION_MODEL_OPTIONS: AtlasSelectOption[] = [
   { value: "gpt-4o-mini-transcribe", label: "gpt-4o-mini-transcribe" },
   { value: "gpt-4o-transcribe", label: "gpt-4o-transcribe" },
   { value: "whisper-1", label: "whisper-1" }
+];
+const SUMMARY_MODEL_OPTIONS: AtlasSelectOption[] = [
+  { value: "gpt-5.4", label: "gpt-5.4" },
+  { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
+  { value: "gpt-5.5", label: "gpt-5.5" }
 ];
 const LANGUAGE_HINT_OPTIONS: AtlasSelectOption[] = [
   { value: "zh", label: "Chinese" },
@@ -866,7 +909,7 @@ function App() {
             </div>
             <DataRow label="Local Whisper" value={status?.sidecar.executableExists ? "Runtime installed" : "Runtime missing"} tone={status?.sidecar.executableExists ? "ready" : "warn"} />
             <DataRow label="Model" value={status?.sidecar.model.verified ? `${status.sidecar.model.id} verified` : `${settings.localTranscriptionModel} missing`} tone={status?.sidecar.model.verified ? "ready" : "warn"} />
-            <DataRow label="Codex" value={`${settings.summaryProvider} · gpt-5.4`} tone="ready" />
+            <DataRow label="Codex" value={`${settings.summaryProvider} · ${settings.summaryModel}`} tone="ready" />
             <DataRow label="OpenAI STT" value={settings.transcriptionProvider === "openai-api" ? settings.openaiTranscriptionModel : "Optional"} />
             <button className="secondary-action sidecar-folder-action" type="button" onClick={() => void callBackend<void>("open_sidecar_folder")} aria-label="Open sidecar folder">
               <FolderOpen size={16} aria-hidden="true" />
@@ -891,7 +934,7 @@ function App() {
               <AtlasSelect value={settings.transcriptionProvider} options={TRANSCRIPTION_PROVIDER_OPTIONS} onChange={(value) => void updateSetting("transcription_provider", value)} />
             </div>
             <div className="field">
-              <span>Local model</span>
+              <span>Whisper model</span>
               <AtlasSelect
                 value={settings.localTranscriptionModel}
                 options={LOCAL_MODEL_OPTIONS}
@@ -915,6 +958,10 @@ function App() {
             <div className="field">
               <span>Summary language</span>
               <AtlasSelect value={settings.summaryLanguage} options={SUMMARY_LANGUAGE_OPTIONS} onChange={(value) => void updateSetting("summary_language", value)} />
+            </div>
+            <div className="field">
+              <span>Codex model</span>
+              <AtlasSelect value={settings.summaryModel} options={SUMMARY_MODEL_OPTIONS} onChange={(value) => void updateSetting("summary_model", value)} />
             </div>
           </section>
         </aside>
@@ -1087,13 +1134,34 @@ function MeetingDetailView({
   onOpenExports: () => void;
 }) {
   const summary = detail.summary;
-  const topics = parseStringArray(summary?.topicsJson);
-  const decisions = parseObjectArray(summary?.decisionsJson, "text");
   const actionItems = parseActionItems(summary?.actionItemsJson);
-  const questions = parseObjectArray(summary?.risksOrQuestionsJson, "text");
+  const summaryOutline = parseSummaryOutline(summary?.rawJson);
+  const summaryPanelRef = React.useRef<HTMLElement | null>(null);
+  const [syncedSummaryHeight, setSyncedSummaryHeight] = React.useState<number | null>(null);
   const duration = detail.meeting.endedAt
     ? `${Math.max(1, Math.round((new Date(detail.meeting.endedAt).getTime() - new Date(detail.meeting.startedAt).getTime()) / 60000))}m`
     : "In progress";
+  React.useLayoutEffect(() => {
+    const panel = summaryPanelRef.current;
+    if (!panel) return undefined;
+    const media = window.matchMedia("(min-width: 681px)");
+    const updateHeight = () => {
+      setSyncedSummaryHeight(media.matches ? Math.max(360, Math.ceil(panel.getBoundingClientRect().height)) : null);
+    };
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(panel);
+    window.addEventListener("resize", updateHeight);
+    media.addEventListener("change", updateHeight);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateHeight);
+      media.removeEventListener("change", updateHeight);
+    };
+  }, [detail.meeting.id, summary?.rawJson, summary?.overview, summaryOutline.length, actionItems.length]);
+  const transcriptSyncStyle = syncedSummaryHeight
+    ? ({ "--summary-panel-height": `${syncedSummaryHeight}px` } as React.CSSProperties)
+    : undefined;
 
   return (
     <section className="detail-surface session-record">
@@ -1124,7 +1192,7 @@ function MeetingDetailView({
       </div>
 
       <div className="detail-content-grid">
-        <section className="panel section-panel summary-panel">
+        <section className="panel section-panel summary-panel" ref={summaryPanelRef}>
           <div className="panel-title-row">
             <div>
               <p className="section-label">Summary</p>
@@ -1135,17 +1203,14 @@ function MeetingDetailView({
           {summary ? (
             <>
               <p className="summary-overview">{summary.overview}</p>
-              <SummarySection title="Topics" items={topics} />
-              <SummarySection title="Decisions" items={decisions} />
-              <SummarySection title="Action items" items={actionItems} checkable />
-              <SummarySection title="Open questions" items={questions} />
+              <SummaryOutline sections={summaryOutline} />
             </>
           ) : (
             <EmptyState title="Ready for Codex" text="Generate a summary after transcript segments exist." />
           )}
         </section>
 
-        <section className="panel section-panel transcript-panel">
+        <section className="panel section-panel transcript-panel" style={transcriptSyncStyle}>
           <div className="panel-title-row">
             <div>
               <p className="section-label">Transcript</p>
@@ -1378,11 +1443,49 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function SummarySection({ title, items, checkable = false }: { title: string; items: string[]; checkable?: boolean }) {
-  if (items.length === 0) return null;
+function SummaryOutline({ sections }: { sections: SummaryOutlineSection[] }) {
+  if (sections.length === 0) return null;
   return (
-    <div className="summary-section">
-      <h4>{title}</h4>
+    <div className="summary-section summary-outline">
+      <h4>Meeting record</h4>
+      <div className="summary-outline-list">
+        {sections.map((section) => (
+          <section className="summary-outline-section" key={`${section.title}-${section.summary}`}>
+            <div className="summary-outline-section-heading">
+              <strong>{section.title}</strong>
+              {section.summary ? <small>{section.summary}</small> : null}
+            </div>
+            <div className="summary-outline-items">
+              {section.items.map((item) => (
+                <details className="summary-outline-item" key={`${section.title}-${item.title}-${item.detail}`}>
+                  <summary>
+                    <span className="summary-outline-item-heading">
+                      <strong>{item.title}</strong>
+                      <small>{item.summary}</small>
+                    </span>
+                    <ChevronDown size={15} aria-hidden="true" />
+                  </summary>
+                  <div className="summary-outline-item-body">
+                    <p>{item.detail}</p>
+                    {item.decisions.length > 0 ? <InlineNoteList title="Decisions" items={item.decisions} /> : null}
+                    {item.actionItems.length > 0 ? <InlineNoteList title="Actions" items={item.actionItems} checkable /> : null}
+                    {item.openQuestions.length > 0 ? <InlineNoteList title="Open questions" items={item.openQuestions} /> : null}
+                    {item.evidence ? <small>{item.evidence}</small> : null}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function InlineNoteList({ title, items, checkable = false }: { title: string; items: string[]; checkable?: boolean }) {
+  return (
+    <div className="inline-note-list">
+      <h5>{title}</h5>
       <ul>
         {items.map((item) => (
           <li key={item}>{checkable ? "[ ] " : ""}{item}</li>
@@ -1412,16 +1515,149 @@ function parseStringArray(raw?: string | null): string[] {
   }
 }
 
-function parseObjectArray(raw: string | undefined | null, field: string): string[] {
+function parseSummaryOutline(raw?: string | null): SummaryOutlineSection[] {
   if (!raw) return [];
   try {
     const value = JSON.parse(raw);
-    return Array.isArray(value)
-      ? value.map((item) => item?.[field]).filter((item): item is string => typeof item === "string")
-      : [];
+    if (Array.isArray(value?.summaryOutline)) {
+      const sections = value.summaryOutline
+        .map((item: unknown) => normalizeSummaryOutlineSection(item))
+        .filter((item: SummaryOutlineSection | null): item is SummaryOutlineSection => item !== null);
+      if (sections.length > 0) return sections;
+    }
   } catch {
     return [];
   }
+
+  const legacyNotes = parseStructuredNotes(raw);
+  if (legacyNotes.length === 0) return [];
+  const grouped = new Map<string, SummaryOutlineItem[]>();
+  for (const note of legacyNotes) {
+    const sectionTitle = formatSectionTitle(note.category);
+    const items = grouped.get(sectionTitle) ?? [];
+    items.push({
+      title: note.title,
+      summary: note.summary,
+      detail: note.detail,
+      evidence: note.evidence,
+      decisions: note.decisions,
+      actionItems: note.actionItems,
+      openQuestions: note.openQuestions
+    });
+    grouped.set(sectionTitle, items);
+  }
+  return Array.from(grouped.entries()).map(([title, items]) => ({
+    title,
+    summary: "",
+    items
+  }));
+}
+
+function normalizeSummaryOutlineSection(item: unknown): SummaryOutlineSection | null {
+  if (!item || typeof item !== "object") return null;
+  const record = item as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+  const items = Array.isArray(record.items)
+    ? record.items
+        .map((entry: unknown) => normalizeSummaryOutlineItem(entry))
+        .filter((entry: SummaryOutlineItem | null): entry is SummaryOutlineItem => entry !== null)
+    : [];
+  if (!title || items.length === 0) return null;
+  return { title, summary, items };
+}
+
+function normalizeSummaryOutlineItem(item: unknown): SummaryOutlineItem | null {
+  if (!item || typeof item !== "object") return null;
+  const record = item as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const summary = typeof record.summary === "string" ? record.summary.trim() : title;
+  const detail = typeof record.detail === "string" ? record.detail.trim() : "";
+  const evidence = typeof record.evidence === "string" ? record.evidence.trim() : null;
+  if (!title || !detail) return null;
+  return {
+    title,
+    summary: summary || title,
+    detail,
+    evidence,
+    decisions: parseStringList(record.decisions),
+    actionItems: parseStringList(record.actionItems),
+    openQuestions: parseStringList(record.openQuestions)
+  };
+}
+
+function parseDetailedNotes(raw?: string | null): DetailedSummaryNote[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw);
+    if (!Array.isArray(value?.detailedNotes)) return [];
+    return value.detailedNotes
+      .map((item: unknown) => {
+        if (!item || typeof item !== "object") return null;
+        const record = item as Record<string, unknown>;
+        const title = typeof record.title === "string" ? record.title.trim() : "";
+        const detail = typeof record.detail === "string" ? record.detail.trim() : "";
+        const evidence = typeof record.evidence === "string" ? record.evidence.trim() : null;
+        return title && detail ? { title, detail, evidence } : null;
+      })
+      .filter((item: DetailedSummaryNote | null): item is DetailedSummaryNote => item !== null);
+  } catch {
+    return [];
+  }
+}
+
+function parseStructuredNotes(raw?: string | null): StructuredSummaryNote[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw);
+    if (Array.isArray(value?.structuredNotes)) {
+      return value.structuredNotes
+        .map((item: unknown) => normalizeStructuredNote(item))
+        .filter((item: StructuredSummaryNote | null): item is StructuredSummaryNote => item !== null);
+    }
+  } catch {
+    return [];
+  }
+  return parseDetailedNotes(raw).map((note) => ({
+    title: note.title,
+    category: "other",
+    summary: note.title,
+    detail: note.detail,
+    evidence: note.evidence,
+    decisions: [],
+    actionItems: [],
+    openQuestions: []
+  }));
+}
+
+function normalizeStructuredNote(item: unknown): StructuredSummaryNote | null {
+  if (!item || typeof item !== "object") return null;
+  const record = item as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  const category = typeof record.category === "string" ? record.category.trim() : "other";
+  const summary = typeof record.summary === "string" ? record.summary.trim() : title;
+  const detail = typeof record.detail === "string" ? record.detail.trim() : "";
+  const evidence = typeof record.evidence === "string" ? record.evidence.trim() : null;
+  if (!title || !detail) return null;
+  return {
+    title,
+    category: category || "other",
+    summary: summary || title,
+    detail,
+    evidence,
+    decisions: parseStringList(record.decisions),
+    actionItems: parseStringList(record.actionItems),
+    openQuestions: parseStringList(record.openQuestions)
+  };
+}
+
+function parseStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+}
+
+function formatSectionTitle(value: string): string {
+  const normalized = value.replace(/[-_]/g, " ").trim();
+  return normalized || "Meeting notes";
 }
 
 function parseActionItems(raw?: string | null): string[] {
@@ -1519,6 +1755,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       ...mockSettings,
       ...(key === "raw_audio_retention_days" ? { rawAudioRetentionDays: Number(value) } : {}),
       ...(key === "transcription_provider" ? { transcriptionProvider: value } : {}),
+      ...(key === "summary_model" ? { summaryModel: value } : {}),
       ...(key === "local_transcription_model" ? { localTranscriptionModel: value } : {}),
       ...(key === "openai_transcription_model" ? { openaiTranscriptionModel: value } : {}),
       ...(key === "language_hint" ? { languageHint: value } : {}),
@@ -1639,14 +1876,17 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       meetingId: id,
       suggestedTitle: detail.summary.suggestedTitle,
       provider: "codex-cli",
-      model: "gpt-5.4",
+      model: mockSettings.summaryModel,
       language: "zh-CN",
       overview: detail.summary.overview,
       topics: parseStringArray(detail.summary.topicsJson),
       decisions: [{ text: "Keep the local-first sidecar transcription path.", evidence: null }],
       actionItems: [{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }],
       openQuestions: [],
-      rawJson: "{}"
+      summaryOutline: parseSummaryOutline(detail.summary.rawJson),
+      structuredNotes: parseStructuredNotes(detail.summary.rawJson),
+      detailedNotes: parseDetailedNotes(detail.summary.rawJson),
+      rawJson: detail.summary.rawJson
     } as T;
   }
   if (command === "export_meeting_as_markdown" || command === "export_meeting_as_json") {
@@ -1738,23 +1978,132 @@ function makeSegments(id: string): TranscriptSegmentRecord[] {
       endMs: 28000,
       text: "The next step is making the meeting history, search, summary, and export flow usable every day.",
       provider
+    },
+    {
+      id: `${id}-segment-3`,
+      meetingId: id,
+      sourceKind: "microphone",
+      speakerLabel: "Me",
+      language: "auto",
+      startMs: 31000,
+      endMs: 47000,
+      text: "We also need the summary to keep enough context for reviewing a long meeting, not just a handful of bullets.",
+      provider
+    },
+    {
+      id: `${id}-segment-4`,
+      meetingId: id,
+      sourceKind: "system",
+      speakerLabel: "Others",
+      language: "auto",
+      startMs: 52000,
+      endMs: 69000,
+      text: "A concise version is useful for scanning, but the reviewer should be able to expand details and see why the summary made those calls.",
+      provider
+    },
+    {
+      id: `${id}-segment-5`,
+      meetingId: id,
+      sourceKind: "microphone",
+      speakerLabel: "Me",
+      language: "auto",
+      startMs: 74000,
+      endMs: 91000,
+      text: "The transcript panel should feel paired with the summary panel so the two panes behave like one review instrument.",
+      provider
+    },
+    {
+      id: `${id}-segment-6`,
+      meetingId: id,
+      sourceKind: "system",
+      speakerLabel: "Others",
+      language: "auto",
+      startMs: 96000,
+      endMs: 116000,
+      text: "On tablet widths, keeping every column visible makes the central workspace too narrow for the recording controls and detail review.",
+      provider
     }
   ];
 }
 
 function makeSummary(id: string): MeetingSummaryRecord {
+  const rawSummary = {
+    suggestedTitle: "Local transcription smoke review",
+    language: "zh-CN",
+    overview: "本次会议验证了本地录音、分段转录、Codex 总结和导出流程。可推断的负责人和截止日期保持为空，避免臆造。",
+    topics: ["Local recording", "Whisper transcription", "Codex summary"],
+    decisions: [{ text: "Keep the local-first sidecar transcription path.", evidence: null }],
+    actionItems: [{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }],
+    openQuestions: [],
+    summaryOutline: [
+      {
+        title: "Local capture path",
+        summary: "The meeting validates the local recording and transcription path as one review flow.",
+        items: [
+          {
+            title: "Microphone and computer audio stay separated",
+            summary: "The app stores separate local chunks and preserves source labels.",
+            detail: "The mock review confirms microphone and computer audio remain separate local chunks. The transcript preserves source labels, which is enough for the current source-attributed meeting record without claiming full diarization.",
+            evidence: "0:00, 0:15",
+            decisions: ["Keep source attribution instead of claiming full speaker diarization."],
+            actionItems: [],
+            openQuestions: []
+          },
+          {
+            title: "Stop-recording worker still needs hardening",
+            summary: "The local capture path needs a proper worker boundary for stopping.",
+            detail: "Stopping should wait for the active chunk to finish and then persist the meeting cleanly, rather than leaving the UI to infer whether the background worker has finished.",
+            evidence: "0:15",
+            decisions: [],
+            actionItems: ["Add a proper stop-recording worker."],
+            openQuestions: []
+          }
+        ]
+      },
+      {
+        title: "Summary review model",
+        summary: "Summary should be one structured meeting record with expandable points.",
+        items: [
+          {
+            title: "Use an integrated outline instead of a detail dump",
+            summary: "The summary should not split into a top summary and a flat detailed notes list.",
+            detail: "The summary should keep a fast-scannable overview while also retaining enough detail for someone to reconstruct the discussion later. The review surface should read like one structured meeting record: section, point, and expandable detail.",
+            evidence: "0:31, 0:52",
+            decisions: ["Render the meeting record as grouped expandable points."],
+            actionItems: [],
+            openQuestions: []
+          }
+        ]
+      },
+      {
+        title: "Review layout",
+        summary: "Summary and transcript should act as paired review panes.",
+        items: [
+          {
+            title: "Transcript height follows the summary panel",
+            summary: "The right transcript pane should feel paired with the left summary record.",
+            detail: "The transcript and summary are treated as paired review panes. On wider detail layouts, the transcript scroll region stretches to the summary panel height instead of using a hard viewport cap.",
+            evidence: "1:14",
+            decisions: [],
+            actionItems: [],
+            openQuestions: ["Whether transcript height should follow the collapsed or expanded summary state."]
+          }
+        ]
+      }
+    ]
+  };
   return {
     meetingId: id,
     suggestedTitle: "Local transcription smoke review",
     provider: "codex-cli",
-    model: "gpt-5.4",
+    model: mockSettings.summaryModel,
     language: "zh-CN",
     overview: "本次会议验证了本地录音、分段转录、Codex 总结和导出流程。可推断的负责人和截止日期保持为空，避免臆造。",
     topicsJson: JSON.stringify(["Local recording", "Whisper transcription", "Codex summary"]),
     decisionsJson: JSON.stringify([{ text: "Keep the local-first sidecar transcription path.", evidence: null }]),
     actionItemsJson: JSON.stringify([{ task: "Add a proper stop-recording worker.", owner: null, dueDate: null, evidence: null }]),
     risksOrQuestionsJson: JSON.stringify([]),
-    rawJson: "{}",
+    rawJson: JSON.stringify(rawSummary),
     generatedAt: new Date().toISOString()
   };
 }

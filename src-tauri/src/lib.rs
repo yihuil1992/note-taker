@@ -34,7 +34,7 @@ use storage::{
     search_meetings as search_meeting_records, set_app_setting, AppSettingsRecord,
     MeetingDetailRecord, MeetingListItem,
 };
-use summary::{summarize_meeting_with_codex, MeetingSummaryResult};
+use summary::{summarize_meeting_with_codex_model, MeetingSummaryResult};
 use tauri::Manager;
 use updates::{check_latest_release, AppUpdateCheck};
 
@@ -219,10 +219,18 @@ async fn summarize_meeting_demo(
 ) -> Result<MeetingSummaryResult, String> {
     let paths = AppPaths::resolve(&app)?;
     paths.ensure()?;
+    initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
+    let settings = load_app_settings(&paths.database_path).map_err(|error| error.to_string())?;
     let database_path = paths.database_path;
     let summaries_dir = paths.summaries_dir;
+    let summary_model = settings.summary_model;
     tauri::async_runtime::spawn_blocking(move || {
-        summarize_meeting_with_codex(&database_path, &summaries_dir, &meeting_id)
+        summarize_meeting_with_codex_model(
+            &database_path,
+            &summaries_dir,
+            &meeting_id,
+            &summary_model,
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -454,6 +462,7 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         "raw_audio_retention_days" => matches!(value, "0" | "7" | "30" | "365"),
         "transcription_provider" => matches!(value, "local-whisper" | "openai-api"),
         "summary_provider" => matches!(value, "codex-cli" | "openai-api" | "local-llm"),
+        "summary_model" => matches!(value, "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"),
         "local_transcription_model" => matches!(value, "large-v3-turbo" | "large-v3"),
         "openai_transcription_model" => matches!(
             value,
