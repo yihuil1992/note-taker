@@ -179,7 +179,7 @@ pub struct MeetingRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetingListItem {
     pub id: String,

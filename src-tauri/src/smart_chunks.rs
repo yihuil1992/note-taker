@@ -10,11 +10,31 @@ const FRAME_MS: i64 = 100;
 const QUIET_RMS_THRESHOLD: f64 = 0.004;
 const MIN_UTTERANCE_MS: i64 = 1_200;
 const END_OF_TURN_SILENCE_MS: i64 = 900;
-const SAME_SOURCE_GAP_MS: i64 = 1_500;
-const MAX_UTTERANCE_MS: i64 = 16_000;
-const PRE_ROLL_MS: i64 = 150;
-const POST_ROLL_MS: i64 = 250;
+const MICROPHONE_TARGET_WINDOW_MS: i64 = 24_000;
+const MICROPHONE_MAX_WINDOW_MS: i64 = 30_000;
+const SYSTEM_TARGET_WINDOW_MS: i64 = 16_000;
+const SYSTEM_MAX_WINDOW_MS: i64 = 20_000;
+const PRE_ROLL_MS: i64 = 1_000;
+const POST_ROLL_MS: i64 = 1_000;
 const DOMINANCE_RATIO: f64 = 1.25;
+const TARGET_WINDOW_RMS: f64 = 0.045;
+const MAX_NORMALIZATION_GAIN: f64 = 3.0;
+const MIN_NORMALIZATION_RMS: f64 = 0.008;
+
+#[derive(Debug, Clone, Copy)]
+struct WindowPolicy {
+    target_ms: i64,
+    max_output_ms: i64,
+    same_source_gap_ms: i64,
+    pre_roll_ms: i64,
+    post_roll_ms: i64,
+}
+
+impl WindowPolicy {
+    fn max_core_ms(self) -> i64 {
+        self.max_output_ms - self.pre_roll_ms - self.post_roll_ms
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SmartChunkError {
@@ -215,7 +235,7 @@ fn build_turn_runs(timelines: &BTreeMap<String, SourceTimeline>) -> Vec<SourceRu
         push_run(&mut raw_runs, source, active_start, end);
     }
 
-    split_long_runs(merge_short_gaps(raw_runs))
+    split_long_runs(merge_context_runs(merge_short_gaps(raw_runs)))
 }
 
 fn dominant_source(
@@ -270,9 +290,28 @@ fn merge_short_gaps(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     let mut merged: Vec<SourceRun> = Vec::new();
     for run in runs {
         if let Some(previous) = merged.last_mut() {
+            let policy = window_policy(&run.source_kind);
             if previous.source_kind == run.source_kind
-                && run.start_ms - previous.end_ms <= SAME_SOURCE_GAP_MS
+                && run.start_ms - previous.end_ms <= policy.same_source_gap_ms
             {
+                previous.end_ms = run.end_ms;
+                continue;
+            }
+        }
+        merged.push(run);
+    }
+    merged
+}
+
+fn merge_context_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
+    let mut merged: Vec<SourceRun> = Vec::new();
+    for run in runs {
+        if let Some(previous) = merged.last_mut() {
+            let policy = window_policy(&run.source_kind);
+            let same_source = previous.source_kind == run.source_kind;
+            let short_gap = run.start_ms - previous.end_ms <= policy.same_source_gap_ms;
+            let combined = run.end_ms - previous.start_ms;
+            if same_source && short_gap && combined <= policy.max_core_ms() {
                 previous.end_ms = run.end_ms;
                 continue;
             }
@@ -285,14 +324,15 @@ fn merge_short_gaps(runs: Vec<SourceRun>) -> Vec<SourceRun> {
 fn split_long_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     let mut split = Vec::new();
     for run in runs {
+        let policy = window_policy(&run.source_kind);
         let mut start = run.start_ms;
-        while run.end_ms - start > MAX_UTTERANCE_MS {
+        while run.end_ms - start > policy.max_core_ms() {
             split.push(SourceRun {
                 source_kind: run.source_kind.clone(),
                 start_ms: start,
-                end_ms: start + MAX_UTTERANCE_MS,
+                end_ms: (start + policy.target_ms).min(run.end_ms),
             });
-            start += MAX_UTTERANCE_MS;
+            start += policy.target_ms;
         }
         if run.end_ms - start >= MIN_UTTERANCE_MS {
             split.push(SourceRun {
@@ -305,14 +345,34 @@ fn split_long_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     split
 }
 
+fn window_policy(source_kind: &str) -> WindowPolicy {
+    match source_kind {
+        "system" => WindowPolicy {
+            target_ms: SYSTEM_TARGET_WINDOW_MS,
+            max_output_ms: SYSTEM_MAX_WINDOW_MS,
+            same_source_gap_ms: 1_200,
+            pre_roll_ms: PRE_ROLL_MS,
+            post_roll_ms: POST_ROLL_MS,
+        },
+        _ => WindowPolicy {
+            target_ms: MICROPHONE_TARGET_WINDOW_MS,
+            max_output_ms: MICROPHONE_MAX_WINDOW_MS,
+            same_source_gap_ms: 2_500,
+            pre_roll_ms: PRE_ROLL_MS,
+            post_roll_ms: POST_ROLL_MS,
+        },
+    }
+}
+
 fn write_window(
     timeline: &SourceTimeline,
     output_dir: &Path,
     run_start_ms: i64,
     run_end_ms: i64,
 ) -> Result<TranscriptionWindow, SmartChunkError> {
-    let absolute_start_ms = (run_start_ms - PRE_ROLL_MS).max(timeline.started_at_ms);
-    let absolute_end_ms = (run_end_ms + POST_ROLL_MS).min(timeline.end_ms());
+    let policy = window_policy(&timeline.source_kind);
+    let absolute_start_ms = (run_start_ms - policy.pre_roll_ms).max(timeline.started_at_ms);
+    let absolute_end_ms = (run_end_ms + policy.post_roll_ms).min(timeline.end_ms());
     let duration_ms = absolute_end_ms.saturating_sub(absolute_start_ms);
     let safe_source = timeline.source_kind.replace(['\\', '/', ':'], "-");
     let path = output_dir.join(format!(
@@ -351,12 +411,45 @@ fn write_sample_slice(
     let channels = usize::from(timeline.spec.channels);
     let start_sample = start_frame * channels;
     let end_sample = end_frame * channels;
+    let samples = normalize_window_samples(&timeline.samples[start_sample..end_sample]);
     let mut writer = WavWriter::create(output_path, timeline.spec)?;
-    for sample in &timeline.samples[start_sample..end_sample] {
-        writer.write_sample(*sample)?;
+    for sample in samples {
+        writer.write_sample(sample)?;
     }
     writer.finalize()?;
     Ok(())
+}
+
+fn normalize_window_samples(samples: &[i16]) -> Vec<i16> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let rms = rms_for_samples(samples);
+    if rms < MIN_NORMALIZATION_RMS || rms >= TARGET_WINDOW_RMS {
+        return samples.to_vec();
+    }
+    let gain = (TARGET_WINDOW_RMS / rms).min(MAX_NORMALIZATION_GAIN);
+    samples
+        .iter()
+        .map(|sample| {
+            let scaled = f64::from(*sample) * gain;
+            scaled.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+        })
+        .collect()
+}
+
+fn rms_for_samples(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum = samples
+        .iter()
+        .map(|sample| {
+            let normalized = f64::from(*sample) / f64::from(i16::MAX);
+            normalized * normalized
+        })
+        .sum::<f64>();
+    (sum / samples.len() as f64).sqrt()
 }
 
 fn overlapping_chunk_ids(timeline: &SourceTimeline, start_ms: i64, end_ms: i64) -> Vec<String> {
@@ -459,4 +552,122 @@ fn ms_to_frames(ms: i64, spec: WavSpec) -> usize {
 
 fn frames_to_ms(frames: usize, spec: WavSpec) -> i64 {
     ((frames as u128 * 1000) / u128::from(spec.sample_rate)) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_spec() -> WavSpec {
+        WavSpec {
+            channels: 1,
+            sample_rate: 1_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        }
+    }
+
+    fn write_test_wav(path: &Path, duration_ms: i64, sample: i16) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create wav parent");
+        }
+        let spec = test_spec();
+        let mut writer = WavWriter::create(path, spec).expect("create wav");
+        let frames = ms_to_frames(duration_ms, spec);
+        for _ in 0..frames {
+            writer.write_sample(sample).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
+
+    fn chunk(
+        root: &Path,
+        source_kind: &str,
+        start_ms: i64,
+        duration_ms: i64,
+        sample: i16,
+    ) -> AudioChunkRecord {
+        let path = root.join(format!("{source_kind}-{start_ms}-{duration_ms}.wav"));
+        write_test_wav(&path, duration_ms, sample);
+        AudioChunkRecord {
+            id: format!("{source_kind}-{start_ms}"),
+            meeting_id: "meeting-a".to_string(),
+            source_kind: source_kind.to_string(),
+            started_at_ms: start_ms,
+            duration_ms,
+            path: path.display().to_string(),
+            status: "captured".to_string(),
+            transcription_error: None,
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "note-taker-smart-chunks-test-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn merges_same_source_context_across_short_silence() {
+        let root = temp_root();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let chunks = vec![
+            chunk(&input_dir, "microphone", 0, 10_000, 4_000),
+            chunk(&input_dir, "microphone", 12_000, 10_000, 4_000),
+        ];
+
+        let windows = build_transcription_windows(&chunks, &output_dir).expect("build windows");
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].source_kind, "microphone");
+        assert_eq!(windows[0].started_at_ms, 0);
+        assert!(windows[0].duration_ms >= 21_000);
+
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn splits_long_context_windows_without_returning_to_tiny_chunks() {
+        let root = temp_root();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let chunks = vec![chunk(&input_dir, "system", 0, 70_000, 4_000)];
+
+        let windows = build_transcription_windows(&chunks, &output_dir).expect("build windows");
+
+        assert_eq!(windows.len(), 5);
+        assert!(windows.iter().all(|window| window.source_kind == "system"));
+        assert!(windows.iter().all(
+            |window| window.duration_ms <= SYSTEM_TARGET_WINDOW_MS + PRE_ROLL_MS + POST_ROLL_MS
+        ));
+        assert!(windows.iter().all(|window| window.duration_ms >= 6_000));
+
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn ignores_silent_audio() {
+        let root = temp_root();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let chunks = vec![chunk(&input_dir, "microphone", 0, 10_000, 0)];
+
+        let windows = build_transcription_windows(&chunks, &output_dir).expect("build windows");
+
+        assert!(windows.is_empty());
+
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn normalization_applies_limited_gain_to_quiet_windows() {
+        let samples = vec![400_i16; 1_000];
+
+        let normalized = normalize_window_samples(&samples);
+
+        assert!(rms_for_samples(&normalized) > rms_for_samples(&samples));
+        assert!(normalized.iter().all(|sample| *sample <= 1_200));
+    }
 }

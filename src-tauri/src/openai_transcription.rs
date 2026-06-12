@@ -10,6 +10,8 @@ const DEFAULT_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
 pub enum OpenAiTranscriptionError {
     #[error("OPENAI_API_KEY is not set. Set it before using OpenAI API transcription.")]
     MissingApiKey,
+    #[error("OpenAI credential error: {0}")]
+    Credential(#[from] crate::openai_credentials::OpenAiCredentialError),
     #[error("Input audio file does not exist: {0}")]
     MissingInput(String),
     #[error("File system error: {0}")]
@@ -50,8 +52,8 @@ pub fn transcribe_audio_file(
             input_path.display().to_string(),
         ));
     }
-    let api_key =
-        std::env::var("OPENAI_API_KEY").map_err(|_| OpenAiTranscriptionError::MissingApiKey)?;
+    let api_key = crate::openai_credentials::load_api_key()?
+        .ok_or(OpenAiTranscriptionError::MissingApiKey)?;
     fs::create_dir_all(output_dir)?;
 
     let model = normalize_model(model);
