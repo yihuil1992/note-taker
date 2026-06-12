@@ -78,7 +78,8 @@ body::before {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -86,7 +87,7 @@ button {
   border: 0;
 }
 
-:where(a, button, input, select):focus-visible {
+:where(a, button, input, select, textarea):focus-visible {
   outline: 0;
   box-shadow: 0 0 0 2px rgba(170, 215, 220, 0.36);
 }
@@ -185,7 +186,7 @@ code {
 
 .atlas-grid {
   display: grid;
-  grid-template-columns: minmax(248px, 290px) minmax(560px, 1fr) minmax(238px, 276px);
+  grid-template-columns: minmax(248px, 290px) minmax(560px, 1fr) minmax(320px, 380px);
   gap: 16px;
   min-height: 0;
   padding: 16px;
@@ -274,6 +275,20 @@ code {
 
 .atlas-footer strong {
   color: var(--accent-strong);
+}
+
+.version-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 760;
+  white-space: nowrap;
 }
 
 .atlas-footer code {
@@ -601,17 +616,15 @@ code {
 }
 
 .meeting-list-item {
+  position: relative;
   display: grid;
-  gap: 6px;
   width: 100%;
   min-width: 0;
-  padding: 12px 12px 11px;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   color: var(--ink);
   background: transparent;
-  text-align: left;
-  cursor: pointer;
   transition:
     border-color 180ms cubic-bezier(0.16, 1, 0.3, 1),
     background-color 180ms cubic-bezier(0.16, 1, 0.3, 1),
@@ -631,6 +644,131 @@ code {
 
 .meeting-list-item:active {
   transform: scale(0.988);
+}
+
+.meeting-list-item-main {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 12px 12px 11px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.meeting-list-item.has-task .meeting-list-item-main {
+  padding-right: 72px;
+}
+
+.meeting-list-stop {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(240, 138, 138, 0.5);
+  border-radius: var(--radius-sm);
+  color: #ffe4e4;
+  background: rgba(240, 138, 138, 0.75);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 760;
+  transition:
+    background-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.meeting-list-stop:hover {
+  background: var(--danger);
+}
+
+.meeting-list-stop:active {
+  transform: scale(0.96);
+}
+
+.meeting-list-stop:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.task-progress {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(170, 215, 220, 0.08);
+}
+
+.task-progress.compact {
+  gap: 6px;
+  padding: 8px;
+  background: rgba(170, 215, 220, 0.06);
+}
+
+.task-progress-copy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-progress-copy strong {
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.task-progress-copy span,
+.task-progress-copy small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-progress-copy small {
+  color: var(--ink-soft);
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.task-progress.compact .task-progress-copy {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.task-progress.compact .task-progress-copy strong {
+  display: none;
+}
+
+.task-progress-bar {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.task-progress-bar span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 220ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.task-progress-bar.indeterminate span {
+  position: absolute;
+  width: 38%;
+  animation: task-progress-sweep 1.1s cubic-bezier(0.16, 1, 0.3, 1) infinite;
 }
 
 .meeting-time {
@@ -716,6 +854,8 @@ code {
 .right-column,
 .detail-surface,
 .meeting-list,
+.summary-scroll,
+.glossary-list,
 .transcript-list {
   scrollbar-color: #9ba99f transparent;
   scrollbar-width: thin;
@@ -725,6 +865,8 @@ code {
 .right-column::-webkit-scrollbar,
 .detail-surface::-webkit-scrollbar,
 .meeting-list::-webkit-scrollbar,
+.summary-scroll::-webkit-scrollbar,
+.glossary-list::-webkit-scrollbar,
 .transcript-list::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -734,6 +876,8 @@ code {
 .right-column::-webkit-scrollbar-thumb,
 .detail-surface::-webkit-scrollbar-thumb,
 .meeting-list::-webkit-scrollbar-thumb,
+.summary-scroll::-webkit-scrollbar-thumb,
+.glossary-list::-webkit-scrollbar-thumb,
 .transcript-list::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: var(--radius-md);
@@ -1032,6 +1176,212 @@ code {
   gap: 5px;
 }
 
+.glossary-panel {
+  display: grid;
+  gap: 11px;
+}
+
+.glossary-heading {
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.glossary-heading > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.glossary-heading small {
+  color: var(--muted-faint);
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.glossary-add {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+.glossary-editor {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.glossary-list {
+  display: grid;
+  gap: 9px;
+  max-height: min(46vh, 460px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.glossary-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 0;
+  padding: 0;
+  overflow: visible;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(16, 24, 39, 0.38);
+}
+
+.glossary-entry-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: calc(var(--radius-md) - 1px);
+  color: var(--ink);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.glossary-entry-summary:hover {
+  background: rgba(170, 215, 220, 0.08);
+}
+
+.glossary-entry-tools {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.glossary-entry-tools > svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+  transition: transform 140ms ease, color 140ms ease;
+}
+
+.glossary-entry.expanded .glossary-entry-tools > svg {
+  color: var(--accent);
+  transform: rotate(180deg);
+}
+
+.glossary-remove-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+}
+
+.glossary-remove-inline:hover {
+  border-color: rgba(240, 138, 138, 0.54);
+  color: #ffe1df;
+  background: rgba(240, 138, 138, 0.12);
+}
+
+.glossary-term-name {
+  overflow: hidden;
+  min-width: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.glossary-term-name.empty {
+  color: var(--muted-faint);
+  font-weight: 640;
+}
+
+.glossary-entry-detail {
+  display: grid;
+  gap: 7px;
+  padding: 0 10px 11px;
+}
+
+.glossary-entry-detail label {
+  display: grid;
+  grid-column: 1;
+  gap: 5px;
+  min-width: 0;
+}
+
+.glossary-entry-detail label span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.glossary-entry-detail input {
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: rgba(2, 4, 10, 0.42);
+  font-size: 12px;
+  outline: 0;
+}
+
+.glossary-entry-detail input::placeholder {
+  color: var(--muted-faint);
+}
+
+.glossary-entry-detail input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(170, 215, 220, 0.2);
+}
+
+.glossary-empty {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-md);
+  color: var(--muted);
+  background: rgba(16, 24, 39, 0.28);
+}
+
+.glossary-empty strong {
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.glossary-empty span,
+.glossary-limit {
+  color: var(--muted-faint);
+  font-size: 11px;
+  font-weight: 560;
+}
+
+.glossary-limit {
+  justify-self: end;
+}
+
+.glossary-limit.over {
+  color: var(--danger);
+}
+
 .atlas-select {
   position: relative;
   width: 100%;
@@ -1294,9 +1644,10 @@ code {
 }
 
 .detail-content-grid {
+  --review-pane-height: clamp(420px, calc(100vh - 392px), 640px);
   display: grid;
   grid-template-columns: minmax(290px, 0.94fr) minmax(290px, 1.06fr);
-  align-items: start;
+  align-items: stretch;
   gap: 14px;
 }
 
@@ -1308,13 +1659,20 @@ code {
 .transcript-panel {
   display: flex;
   flex-direction: column;
+  height: var(--review-pane-height);
+  max-height: var(--review-pane-height);
   min-height: 0;
+  overflow: hidden;
 }
 
-.transcript-panel {
-  height: var(--summary-panel-height, auto);
-  max-height: var(--summary-panel-height, none);
-  overflow: hidden;
+.summary-scroll {
+  display: grid;
+  align-content: start;
+  flex: 1 1 auto;
+  gap: 0;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
 }
 
 .summary-overview {
@@ -1483,6 +1841,7 @@ code {
   gap: 8px;
   min-height: 0;
   overflow: auto;
+  padding-right: 2px;
 }
 
 .transcript-row {
@@ -2050,8 +2409,53 @@ code {
 }
 
 :root[data-atlas-mode="archive"] .atlas-shell .local-ai-panel,
-:root[data-atlas-mode="archive"] .atlas-shell .settings-panel {
+:root[data-atlas-mode="archive"] .atlas-shell .settings-panel,
+:root[data-atlas-mode="archive"] .atlas-shell .glossary-panel {
   background: rgba(255, 255, 252, 0.72);
+}
+
+:root[data-atlas-mode="archive"] .glossary-editor {
+  border-color: rgba(71, 124, 134, 0.22);
+  background: rgba(255, 255, 252, 0.74);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry {
+  border-color: rgba(71, 124, 134, 0.16);
+  background: rgba(237, 240, 234, 0.72);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry-summary:hover {
+  background: rgba(71, 124, 134, 0.08);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry.expanded .glossary-entry-summary {
+  background: rgba(255, 255, 252, 0.42);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry-detail label span {
+  color: var(--muted);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry-detail input {
+  border-color: rgba(71, 124, 134, 0.22);
+  color: var(--ink);
+  background: rgba(255, 255, 252, 0.88);
+}
+
+:root[data-atlas-mode="archive"] .glossary-entry-detail input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(71, 124, 134, 0.2);
+}
+
+:root[data-atlas-mode="archive"] .glossary-remove-inline:hover {
+  border-color: rgba(162, 55, 45, 0.32);
+  color: #8c322b;
+  background: rgba(162, 55, 45, 0.08);
+}
+
+:root[data-atlas-mode="archive"] .glossary-empty {
+  border-color: rgba(71, 124, 134, 0.22);
+  background: rgba(237, 240, 234, 0.58);
 }
 
 :root[data-atlas-mode="archive"] .notice-banner {
@@ -2311,6 +2715,16 @@ code {
   }
 }
 
+@keyframes task-progress-sweep {
+  from {
+    transform: translateX(-110%);
+  }
+
+  to {
+    transform: translateX(280%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -2358,8 +2772,8 @@ code {
     grid-template-columns: 1fr;
   }
 
-  .transcript-list {
-    min-height: 260px;
+  .detail-content-grid {
+    --review-pane-height: min(440px, 68vh);
   }
 
   .atlas-shell .meeting-heading,
@@ -2411,6 +2825,15 @@ code {
   .source-grid,
   .metric-grid {
     grid-template-columns: 1fr;
+  }
+
+  .glossary-heading,
+  .glossary-entry {
+    grid-template-columns: 1fr;
+  }
+
+  .glossary-heading {
+    display: grid;
   }
 
   .meeting-heading,

@@ -9,6 +9,7 @@ pub mod sidecar;
 pub mod smart_chunks;
 pub mod storage;
 pub mod summary;
+pub mod task_control;
 pub mod text_normalization;
 pub mod updates;
 
@@ -30,17 +31,19 @@ use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use storage::{
     archive_meeting as archive_meeting_record, get_app_settings as load_app_settings,
-    get_meeting_detail as load_meeting_detail, initialize_database, list_recent_meetings,
-    search_meetings as search_meeting_records, set_app_setting, AppSettingsRecord,
-    MeetingDetailRecord, MeetingListItem,
+    get_meeting as load_meeting, get_meeting_detail as load_meeting_detail, initialize_database,
+    list_recent_meetings, search_meetings as search_meeting_records, set_app_setting,
+    update_meeting_status, AppSettingsRecord, MeetingDetailRecord, MeetingListItem,
 };
-use summary::{summarize_meeting_with_codex_model, MeetingSummaryResult};
+use summary::{summarize_meeting_with_codex_model_with_cancel, MeetingSummaryResult};
+use task_control::{CancelMeetingTaskResult, MeetingTaskStatus, TaskCancellationRegistry};
 use tauri::Manager;
 use updates::{check_latest_release, AppUpdateCheck};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppStatus {
+    app_version: String,
     app_data_dir: String,
     database_path: String,
     recordings_dir: String,
@@ -67,6 +70,7 @@ fn get_app_status(app: tauri::AppHandle) -> Result<AppStatus, String> {
     let settings = load_app_settings(&paths.database_path).map_err(|error| error.to_string())?;
 
     Ok(AppStatus {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         app_data_dir: display_path(&paths.app_data_dir),
         database_path: display_path(&paths.database_path),
         recordings_dir: display_path(&paths.recordings_dir),
@@ -165,6 +169,7 @@ fn stop_recording(
 #[tauri::command]
 async fn transcribe_meeting_demo(
     app: tauri::AppHandle,
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
     meeting_id: String,
 ) -> Result<MeetingTranscriptionResult, String> {
     let paths = AppPaths::resolve(&app)?;
@@ -173,23 +178,31 @@ async fn transcribe_meeting_demo(
     let sidecar_dir = paths.sidecar_dir;
     let models_dir = paths.models_dir;
     let transcriptions_dir = paths.transcriptions_dir;
-    tauri::async_runtime::spawn_blocking(move || {
+    let token = task_registry
+        .begin(&meeting_id, "transcription")
+        .map_err(|error| error.to_string())?;
+    let worker_meeting_id = meeting_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         transcribe_meeting_chunks(
             &database_path,
             &sidecar_dir,
             &models_dir,
             &transcriptions_dir,
-            &meeting_id,
+            &worker_meeting_id,
+            Some(&token),
         )
     })
     .await
-    .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let _ = task_registry.finish(&meeting_id);
+    result
 }
 
 #[tauri::command]
 async fn retranscribe_meeting_demo(
     app: tauri::AppHandle,
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
     meeting_id: String,
 ) -> Result<MeetingTranscriptionResult, String> {
     let paths = AppPaths::resolve(&app)?;
@@ -198,23 +211,31 @@ async fn retranscribe_meeting_demo(
     let sidecar_dir = paths.sidecar_dir;
     let models_dir = paths.models_dir;
     let transcriptions_dir = paths.transcriptions_dir;
-    tauri::async_runtime::spawn_blocking(move || {
+    let token = task_registry
+        .begin(&meeting_id, "transcription")
+        .map_err(|error| error.to_string())?;
+    let worker_meeting_id = meeting_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         retranscribe_meeting_chunks(
             &database_path,
             &sidecar_dir,
             &models_dir,
             &transcriptions_dir,
-            &meeting_id,
+            &worker_meeting_id,
+            Some(&token),
         )
     })
     .await
-    .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let _ = task_registry.finish(&meeting_id);
+    result
 }
 
 #[tauri::command]
 async fn summarize_meeting_demo(
     app: tauri::AppHandle,
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
     meeting_id: String,
 ) -> Result<MeetingSummaryResult, String> {
     let paths = AppPaths::resolve(&app)?;
@@ -224,17 +245,78 @@ async fn summarize_meeting_demo(
     let database_path = paths.database_path;
     let summaries_dir = paths.summaries_dir;
     let summary_model = settings.summary_model;
-    tauri::async_runtime::spawn_blocking(move || {
-        summarize_meeting_with_codex_model(
+    let token = task_registry
+        .begin(&meeting_id, "summary")
+        .map_err(|error| error.to_string())?;
+    let worker_meeting_id = meeting_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        summarize_meeting_with_codex_model_with_cancel(
             &database_path,
             &summaries_dir,
-            &meeting_id,
+            &worker_meeting_id,
             &summary_model,
+            Some(&token),
         )
     })
     .await
-    .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let _ = task_registry.finish(&meeting_id);
+    result
+}
+
+#[tauri::command]
+fn cancel_meeting_task(
+    app: tauri::AppHandle,
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
+    meeting_id: String,
+) -> Result<CancelMeetingTaskResult, String> {
+    let paths = AppPaths::resolve(&app)?;
+    paths.ensure()?;
+    initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
+    let cancel_requested = task_registry
+        .cancel(&meeting_id)
+        .map_err(|error| error.to_string())?;
+    let status = load_meeting(&paths.database_path, &meeting_id)
+        .map_err(|error| error.to_string())?
+        .map(|meeting| meeting.status)
+        .unwrap_or_else(|| "unknown".to_string());
+    let next_status = match status.as_str() {
+        "transcribing" | "canceling" if cancel_requested => "canceling",
+        "summarizing" if cancel_requested => "canceling",
+        "transcribing" => "transcription_cancelled",
+        "summarizing" => "summary_cancelled",
+        other => other,
+    };
+    if next_status != status {
+        update_meeting_status(&paths.database_path, &meeting_id, next_status)
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(CancelMeetingTaskResult {
+        meeting_id,
+        cancel_requested,
+        status: next_status.to_string(),
+    })
+}
+
+#[tauri::command]
+fn get_meeting_task_status(
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
+    meeting_id: String,
+) -> Result<Option<MeetingTaskStatus>, String> {
+    task_registry
+        .get_status(&meeting_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_meeting_task_statuses(
+    task_registry: tauri::State<'_, TaskCancellationRegistry>,
+) -> Result<Vec<MeetingTaskStatus>, String> {
+    task_registry
+        .list_statuses()
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -470,6 +552,7 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         ),
         "language_hint" => matches!(value, "auto" | "zh" | "ja" | "en"),
         "summary_language" => matches!(value, "auto" | "zh" | "ja" | "en"),
+        "custom_glossary" => value.len() <= 12_000 && !value.contains('\0'),
         "recording_consent_reminder_dismissed" => matches!(value, "true" | "false"),
         _ => false,
     };
@@ -552,8 +635,10 @@ fn open_external_url(url: &str) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RecordingManager::default())
+        .manage(TaskCancellationRegistry::default())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             list_audio_devices,
@@ -565,6 +650,9 @@ pub fn run() {
             transcribe_meeting_demo,
             retranscribe_meeting_demo,
             summarize_meeting_demo,
+            cancel_meeting_task,
+            get_meeting_task_status,
+            list_meeting_task_statuses,
             list_meetings,
             get_meeting_detail,
             search_meetings,

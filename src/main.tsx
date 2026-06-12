@@ -18,13 +18,15 @@ import {
   MonitorSpeaker,
   Moon,
   Play,
+  Plus,
   RefreshCw,
   Search,
   Settings,
   ShieldCheck,
   Sparkles,
   Square,
-  Sun
+  Sun,
+  Trash2
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
@@ -36,6 +38,7 @@ declare global {
 }
 
 type AppStatus = {
+  appVersion: string;
   appDataDir: string;
   databasePath: string;
   recordingsDir: string;
@@ -60,7 +63,14 @@ type AppSettings = {
   openaiTranscriptionModel: string;
   languageHint: string;
   summaryLanguage: string;
+  customGlossary: string;
   recordingConsentReminderDismissed: boolean;
+};
+
+type GlossaryEntry = {
+  id: string;
+  term: string;
+  description: string;
 };
 
 type SidecarStatus = {
@@ -217,6 +227,23 @@ type MeetingSummaryResult = {
   rawJson: string;
 };
 
+type CancelMeetingTaskResult = {
+  meetingId: string;
+  cancelRequested: boolean;
+  status: string;
+};
+
+type MeetingTaskStatus = {
+  meetingId: string;
+  kind: string;
+  phase: string;
+  message: string;
+  current: number;
+  total?: number | null;
+  percent?: number | null;
+  cancelRequested: boolean;
+};
+
 type SummaryOutlineSection = {
   title: string;
   summary: string;
@@ -310,6 +337,7 @@ const defaultSettings: AppSettings = {
   openaiTranscriptionModel: "gpt-4o-mini-transcribe",
   languageHint: "zh",
   summaryLanguage: "auto",
+  customGlossary: "",
   recordingConsentReminderDismissed: false
 };
 const RECORDING_FAILSAFE_SECONDS = 4 * 60 * 60;
@@ -381,9 +409,15 @@ function App() {
   const [exportResult, setExportResult] = React.useState<ExportResult | null>(null);
   const [consentAccepted, setConsentAccepted] = React.useState(false);
   const [activeRecording, setActiveRecording] = React.useState<ActiveRecordingStatus | null>(null);
+  const [taskStatuses, setTaskStatuses] = React.useState<Record<string, MeetingTaskStatus>>({});
   const [updateCheck, setUpdateCheck] = React.useState<AppUpdateCheck | null>(null);
   const [updateCheckStatus, setUpdateCheckStatus] = React.useState<"idle" | "checking" | "failed">("idle");
   const [updateProgress, setUpdateProgress] = React.useState<AppUpdateProgress | null>(null);
+  const [glossaryEntries, setGlossaryEntries] = React.useState<GlossaryEntry[]>(() => parseGlossaryEntries(defaultSettings.customGlossary));
+  const [expandedGlossaryEntryId, setExpandedGlossaryEntryId] = React.useState<string | null>(null);
+  const glossaryDraft = React.useMemo(() => serializeGlossaryEntries(glossaryEntries), [glossaryEntries]);
+  const savedGlossaryDraft = React.useMemo(() => serializeGlossaryEntries(parseGlossaryEntries(settings.customGlossary)), [settings.customGlossary]);
+  const glossaryEntryCount = glossaryEntries.filter((entry) => entry.term.trim() || entry.description.trim()).length;
   const pendingUpdateRef = React.useRef<unknown>(null);
 
   React.useEffect(() => {
@@ -418,21 +452,36 @@ function App() {
     }
   }, [selectedMeetingId]);
 
+  React.useEffect(() => {
+    void refreshTaskStatuses();
+    const handle = window.setInterval(() => {
+      void refreshTaskStatuses();
+    }, 1200);
+    return () => window.clearInterval(handle);
+  }, []);
+
+  React.useEffect(() => {
+    setGlossaryEntries(parseGlossaryEntries(settings.customGlossary));
+    setExpandedGlossaryEntryId(null);
+  }, [settings.customGlossary]);
+
   async function refreshAll(activeMeetingId = selectedMeetingId) {
     setError(null);
     try {
-      const [nextStatus, nextDevices, nextSettings, nextMeetings, nextRecording] = await Promise.all([
+      const [nextStatus, nextDevices, nextSettings, nextMeetings, nextRecording, nextTaskStatuses] = await Promise.all([
         callBackend<AppStatus>("get_app_status"),
         callBackend<AudioDevice[]>("list_audio_devices"),
         callBackend<AppSettings>("get_app_settings"),
         callBackend<MeetingListItem[]>("list_meetings", { limit: 80 }),
-        callBackend<ActiveRecordingStatus | null>("get_active_recording")
+        callBackend<ActiveRecordingStatus | null>("get_active_recording"),
+        callBackend<MeetingTaskStatus[]>("list_meeting_task_statuses")
       ]);
       setStatus(nextStatus);
       setDevices(nextDevices);
       setSettings(nextSettings);
       setMeetings(nextMeetings);
       setActiveRecording(nextRecording);
+      setTaskStatuses(indexTaskStatuses(nextTaskStatuses));
       if (activeMeetingId) {
         setSelectedMeetingId(activeMeetingId);
         await loadDetail(activeMeetingId);
@@ -448,6 +497,15 @@ function App() {
   async function loadDetail(meetingId: string) {
     const nextDetail = await callBackend<MeetingDetail | null>("get_meeting_detail", { meetingId });
     setDetail(nextDetail);
+  }
+
+  async function refreshTaskStatuses() {
+    try {
+      const statuses = await callBackend<MeetingTaskStatus[]>("list_meeting_task_statuses");
+      setTaskStatuses(indexTaskStatuses(statuses));
+    } catch {
+      // Task progress is best-effort and should never interrupt capture or review.
+    }
   }
 
   async function runSearch(nextQuery = query) {
@@ -525,10 +583,20 @@ function App() {
       const result = await callBackend<MeetingTranscriptionResult>("transcribe_meeting_demo", {
         meetingId: selectedMeetingId
       });
-      setNotice(`Transcribed ${result.transcribedChunks} chunks, ${result.failedChunks} failed.`);
+      setNotice(result.status === "transcription_cancelled"
+        ? `Transcription stopped after ${result.transcribedChunks} chunks.`
+        : `Transcribed ${result.transcribedChunks} chunks, ${result.failedChunks} failed.`);
+      if (result.status !== "transcription_cancelled") {
+        void notifyTaskComplete("Transcription complete", `${result.transcribedChunks} chunks transcribed.`);
+      }
       await refreshAll(selectedMeetingId);
     } catch (transcribeError) {
-      setError(String(transcribeError));
+      const message = String(transcribeError);
+      if (isCancellationMessage(message)) {
+        setNotice("Transcription stopped.");
+      } else {
+        setError(message);
+      }
     } finally {
       setBusy(null);
     }
@@ -544,10 +612,20 @@ function App() {
         meetingId: selectedMeetingId
       });
       setExportResult(null);
-      setNotice(`Re-transcribed ${result.transcribedChunks} chunks with current quality settings.`);
+      setNotice(result.status === "transcription_cancelled"
+        ? `Re-transcription stopped after ${result.transcribedChunks} chunks.`
+        : `Re-transcribed ${result.transcribedChunks} chunks with current quality settings.`);
+      if (result.status !== "transcription_cancelled") {
+        void notifyTaskComplete("Re-transcription complete", `${result.transcribedChunks} chunks transcribed.`);
+      }
       await refreshAll(selectedMeetingId);
     } catch (transcribeError) {
-      setError(String(transcribeError));
+      const message = String(transcribeError);
+      if (isCancellationMessage(message)) {
+        setNotice("Re-transcription stopped.");
+      } else {
+        setError(message);
+      }
     } finally {
       setBusy(null);
     }
@@ -562,9 +640,30 @@ function App() {
         meetingId: selectedMeetingId
       });
       setNotice(`Generated summary: ${result.suggestedTitle}`);
+      void notifyTaskComplete("Summary complete", result.suggestedTitle);
       await refreshAll(selectedMeetingId);
     } catch (summaryError) {
-      setError(String(summaryError));
+      const message = String(summaryError);
+      if (isCancellationMessage(message)) {
+        setNotice("Summary generation stopped.");
+      } else {
+        setError(message);
+      }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cancelSelectedTask(meetingId = selectedMeetingId) {
+    if (!meetingId) return;
+    setBusy("canceling");
+    setError(null);
+    try {
+      const result = await callBackend<CancelMeetingTaskResult>("cancel_meeting_task", { meetingId });
+      setNotice(result.cancelRequested ? "Stop requested. Current task is winding down." : "No active worker was found. The meeting was marked stopped.");
+      await refreshAll(meetingId);
+    } catch (cancelError) {
+      setError(String(cancelError));
     } finally {
       setBusy(null);
     }
@@ -640,6 +739,30 @@ function App() {
     const nextSettings = await callBackend<AppSettings>("update_app_setting", { key, value });
     setSettings(nextSettings);
     await refreshAll();
+  }
+
+  async function saveGlossary() {
+    await updateSetting("custom_glossary", glossaryDraft);
+    setNotice("Glossary saved for transcription and summaries.");
+  }
+
+  function addGlossaryEntry() {
+    const entry = createBlankGlossaryEntry();
+    setGlossaryEntries((entries) => [...entries, entry]);
+    setExpandedGlossaryEntryId(entry.id);
+  }
+
+  function updateGlossaryEntry(id: string, patch: Partial<Omit<GlossaryEntry, "id">>) {
+    setGlossaryEntries((entries) => entries.map((entry) => entry.id === id ? { ...entry, ...patch } : entry));
+  }
+
+  function removeGlossaryEntry(id: string) {
+    setGlossaryEntries((entries) => entries.filter((entry) => entry.id !== id));
+    setExpandedGlossaryEntryId((current) => current === id ? null : current);
+  }
+
+  function toggleGlossaryEntry(id: string) {
+    setExpandedGlossaryEntryId((current) => current === id ? null : id);
   }
 
   async function checkForUpdates(silent = false) {
@@ -814,19 +937,45 @@ function App() {
             {meetings.length === 0 ? (
               <EmptyState title="No meetings yet" text="Record a meeting to create searchable local notes." />
             ) : (
-              meetings.map((meeting) => (
-                <button
-                  className={meeting.id === selectedMeetingId ? "meeting-list-item selected" : "meeting-list-item"}
-                  key={meeting.id}
-                  type="button"
-                  onClick={() => setSelectedMeetingId(meeting.id)}
-                >
-                  <span className="meeting-time">{formatDateTime(meeting.startedAt)}</span>
-                  <strong>{meeting.title}</strong>
-                  {meeting.summaryOverview ? <p>{meeting.summaryOverview}</p> : <p>{formatStatus(meeting.status)}</p>}
-                  <small>{meeting.segmentCount} segments · {meeting.actionItemCount} actions</small>
-                </button>
-              ))
+              meetings.map((meeting) => {
+                const taskStatus = taskStatuses[meeting.id];
+                const meetingTaskActive = isTaskActiveStatus(meeting.status) || Boolean(taskStatus);
+                return (
+                  <article
+                    className={[
+                      "meeting-list-item",
+                      meeting.id === selectedMeetingId ? "selected" : "",
+                      meetingTaskActive ? "has-task" : ""
+                    ].filter(Boolean).join(" ")}
+                    key={meeting.id}
+                  >
+                    <button
+                      className="meeting-list-item-main"
+                      type="button"
+                      onClick={() => setSelectedMeetingId(meeting.id)}
+                    >
+                      <span className="meeting-time">{formatDateTime(meeting.startedAt)}</span>
+                      <strong>{meeting.title}</strong>
+                      {meeting.summaryOverview ? <p>{meeting.summaryOverview}</p> : <p>{formatStatus(meeting.status)}</p>}
+                      {taskStatus ? <TaskProgress status={taskStatus} compact /> : null}
+                      <small>{meeting.segmentCount} segments · {meeting.actionItemCount} actions</small>
+                    </button>
+                    {meetingTaskActive ? (
+                      <button
+                        className="meeting-list-stop"
+                        type="button"
+                        onClick={() => void cancelSelectedTask(meeting.id)}
+                        disabled={busy === "canceling"}
+                        aria-label={`Stop task for ${meeting.title}`}
+                        title="Stop current task"
+                      >
+                        <Square size={12} aria-hidden="true" />
+                        Stop
+                      </button>
+                    ) : null}
+                  </article>
+                );
+              })
             )}
           </div>
         </section>
@@ -882,10 +1031,12 @@ function App() {
             <MeetingDetailView
               detail={detail}
               busy={busy}
+              taskStatus={taskStatuses[detail.meeting.id] ?? null}
               exportResult={exportResult}
               onTranscribe={() => void transcribeSelected()}
               onRetranscribe={() => void retranscribeSelected()}
               onSummarize={() => void summarizeSelected()}
+              onCancelTask={() => void cancelSelectedTask()}
               onArchive={() => void archiveSelected()}
               onExportMarkdown={() => void exportSelected("markdown")}
               onExportJson={() => void exportSelected("json")}
@@ -964,12 +1115,111 @@ function App() {
               <AtlasSelect value={settings.summaryModel} options={SUMMARY_MODEL_OPTIONS} onChange={(value) => void updateSetting("summary_model", value)} />
             </div>
           </section>
+
+          <section className="panel glossary-panel">
+            <div className="panel-title-row glossary-heading">
+              <div>
+                <p className="section-label">Glossary</p>
+                <h3>Terms and context</h3>
+                <small>{glossaryEntryCount === 0 ? "No terms yet" : `${glossaryEntryCount} terms`}</small>
+              </div>
+              <button className="ghost-action glossary-add" type="button" onClick={addGlossaryEntry}>
+                <Plus size={14} aria-hidden="true" />
+                Add term
+              </button>
+            </div>
+            <div className="glossary-editor">
+              {glossaryEntries.length === 0 ? (
+                <div className="glossary-empty">
+                  <strong>Add names, acronyms, and internal terms.</strong>
+                  <span>These hints are passed to transcription and summaries.</span>
+                </div>
+              ) : (
+                <div className="glossary-list">
+                  {glossaryEntries.map((entry, index) => {
+                    const isExpanded = expandedGlossaryEntryId === entry.id;
+                    const termLabel = entry.term.trim() || "Untitled term";
+                    return (
+                      <div className={isExpanded ? "glossary-entry expanded" : "glossary-entry"} key={entry.id}>
+                        <button
+                          className="glossary-entry-summary"
+                          type="button"
+                          onClick={() => toggleGlossaryEntry(entry.id)}
+                          aria-expanded={isExpanded}
+                          aria-controls={`glossary-entry-detail-${entry.id}`}
+                        >
+                          <span className={entry.term.trim() ? "glossary-term-name" : "glossary-term-name empty"}>{termLabel}</span>
+                          <span className="glossary-entry-tools">
+                            {isExpanded ? (
+                              <span
+                                className="glossary-remove-inline"
+                                role="button"
+                                tabIndex={0}
+                                aria-label={`Remove glossary entry ${entry.term || index + 1}`}
+                                title="Remove term"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  removeGlossaryEntry(entry.id);
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key !== "Enter" && event.key !== " ") return;
+                                  event.preventDefault();
+                                  event.stopPropagation();
+                                  removeGlossaryEntry(entry.id);
+                                }}
+                              >
+                                <Trash2 size={14} aria-hidden="true" />
+                              </span>
+                            ) : null}
+                            <ChevronDown size={15} aria-hidden="true" />
+                          </span>
+                        </button>
+                        {isExpanded ? (
+                          <div className="glossary-entry-detail" id={`glossary-entry-detail-${entry.id}`}>
+                            <label>
+                              <span>Term</span>
+                              <input
+                                value={entry.term}
+                                maxLength={160}
+                                placeholder={index === 0 ? "RAG" : "Term"}
+                                onChange={(event) => updateGlossaryEntry(entry.id, { term: event.target.value })}
+                              />
+                            </label>
+                            <label>
+                              <span>Explanation</span>
+                              <input
+                                value={entry.description}
+                                maxLength={500}
+                                placeholder={index === 0 ? "retrieval augmented generation" : "Meaning, pronunciation, or context"}
+                                onChange={(event) => updateGlossaryEntry(entry.id, { description: event.target.value })}
+                              />
+                            </label>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <small className={glossaryDraft.length > 12000 ? "glossary-limit over" : "glossary-limit"}>{glossaryDraft.length}/12000</small>
+            </div>
+            <button
+              className="secondary-action full-width"
+              type="button"
+              disabled={glossaryDraft === savedGlossaryDraft || glossaryDraft.length > 12000}
+              onClick={() => void saveGlossary()}
+            >
+              <CheckCircle2 size={15} aria-hidden="true" />
+              Save glossary
+            </button>
+          </section>
         </aside>
       </div>
 
       <footer className="atlas-footer">
         <span className="privacy-dot" />
         <strong>Local only</strong>
+        <span className="version-pill">v{status?.appVersion ?? "0.2.1"}</span>
         <span>{settings.transcriptionProvider === "openai-api" ? "Cloud speech-to-text selected" : "All meeting data stays on this device by default"}</span>
         <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
           <RefreshCw size={14} aria-hidden="true" />
@@ -1110,13 +1360,33 @@ function UpdateNotice({
   );
 }
 
+function TaskProgress({ status, compact = false }: { status: MeetingTaskStatus; compact?: boolean }) {
+  const percent = typeof status.percent === "number" ? Math.max(0, Math.min(100, status.percent)) : null;
+  const label = formatTaskKind(status.kind);
+  const count = status.total ? `${status.current}/${status.total}` : status.phase;
+  return (
+    <div className={compact ? "task-progress compact" : "task-progress"} aria-label={`${label} progress`}>
+      <div className="task-progress-copy">
+        <strong>{label}</strong>
+        <span>{status.cancelRequested ? "Stopping..." : status.message}</span>
+        <small>{percent !== null ? `${percent}% · ${count}` : count}</small>
+      </div>
+      <div className={percent === null ? "task-progress-bar indeterminate" : "task-progress-bar"}>
+        <span style={percent === null ? undefined : { width: `${percent}%` }} />
+      </div>
+    </div>
+  );
+}
+
 function MeetingDetailView({
   detail,
   busy,
+  taskStatus,
   exportResult,
   onTranscribe,
   onRetranscribe,
   onSummarize,
+  onCancelTask,
   onArchive,
   onExportMarkdown,
   onExportJson,
@@ -1124,10 +1394,12 @@ function MeetingDetailView({
 }: {
   detail: MeetingDetail;
   busy: string | null;
+  taskStatus: MeetingTaskStatus | null;
   exportResult: ExportResult | null;
   onTranscribe: () => void;
   onRetranscribe: () => void;
   onSummarize: () => void;
+  onCancelTask: () => void;
   onArchive: () => void;
   onExportMarkdown: () => void;
   onExportJson: () => void;
@@ -1136,32 +1408,10 @@ function MeetingDetailView({
   const summary = detail.summary;
   const actionItems = parseActionItems(summary?.actionItemsJson);
   const summaryOutline = parseSummaryOutline(summary?.rawJson);
-  const summaryPanelRef = React.useRef<HTMLElement | null>(null);
-  const [syncedSummaryHeight, setSyncedSummaryHeight] = React.useState<number | null>(null);
   const duration = detail.meeting.endedAt
     ? `${Math.max(1, Math.round((new Date(detail.meeting.endedAt).getTime() - new Date(detail.meeting.startedAt).getTime()) / 60000))}m`
     : "In progress";
-  React.useLayoutEffect(() => {
-    const panel = summaryPanelRef.current;
-    if (!panel) return undefined;
-    const media = window.matchMedia("(min-width: 681px)");
-    const updateHeight = () => {
-      setSyncedSummaryHeight(media.matches ? Math.max(360, Math.ceil(panel.getBoundingClientRect().height)) : null);
-    };
-    updateHeight();
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(panel);
-    window.addEventListener("resize", updateHeight);
-    media.addEventListener("change", updateHeight);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", updateHeight);
-      media.removeEventListener("change", updateHeight);
-    };
-  }, [detail.meeting.id, summary?.rawJson, summary?.overview, summaryOutline.length, actionItems.length]);
-  const transcriptSyncStyle = syncedSummaryHeight
-    ? ({ "--summary-panel-height": `${syncedSummaryHeight}px` } as React.CSSProperties)
-    : undefined;
+  const taskActive = isTaskActiveStatus(detail.meeting.status) || isTaskBusy(busy) || Boolean(taskStatus);
 
   return (
     <section className="detail-surface session-record">
@@ -1173,16 +1423,24 @@ function MeetingDetailView({
         </div>
         <div className="action-row">
           <span className="meeting-status">{formatStatus(detail.meeting.status)}</span>
-          <button className="secondary-action" type="button" onClick={onArchive} disabled={busy === "archiving"} title="Hide this meeting from the index. Local files are kept.">
+          {taskActive ? (
+            <button className="danger-action" type="button" onClick={onCancelTask} disabled={busy === "canceling"}>
+              <Square size={16} aria-hidden="true" />
+              {busy === "canceling" ? "Stopping..." : "Stop task"}
+            </button>
+          ) : null}
+          <button className="secondary-action" type="button" onClick={onArchive} disabled={busy === "archiving" || taskActive} title="Hide this meeting from the index. Local files are kept.">
             <Archive size={16} aria-hidden="true" />
             {busy === "archiving" ? "Archiving..." : "Archive"}
           </button>
-          <button className="secondary-action" type="button" onClick={onSummarize} disabled={busy === "summarizing" || detail.transcriptSegments.length === 0}>
+          <button className="secondary-action" type="button" onClick={onSummarize} disabled={taskActive || detail.transcriptSegments.length === 0}>
             <Sparkles size={16} aria-hidden="true" />
             {busy === "summarizing" ? "Summarizing..." : "Summarize"}
           </button>
         </div>
       </div>
+
+      {taskStatus ? <TaskProgress status={taskStatus} /> : null}
 
       <div className="metric-grid session-index">
         <Metric label="Chunks" value={String(detail.chunks.length)} />
@@ -1192,7 +1450,7 @@ function MeetingDetailView({
       </div>
 
       <div className="detail-content-grid">
-        <section className="panel section-panel summary-panel" ref={summaryPanelRef}>
+        <section className="panel section-panel summary-panel">
           <div className="panel-title-row">
             <div>
               <p className="section-label">Summary</p>
@@ -1200,17 +1458,19 @@ function MeetingDetailView({
             </div>
             {summary ? <span className="provider-pill">Generated by {summary.provider}</span> : null}
           </div>
-          {summary ? (
-            <>
-              <p className="summary-overview">{summary.overview}</p>
-              <SummaryOutline sections={summaryOutline} />
-            </>
-          ) : (
-            <EmptyState title="Ready for Codex" text="Generate a summary after transcript segments exist." />
-          )}
+          <div className="summary-scroll">
+            {summary ? (
+              <>
+                <p className="summary-overview">{summary.overview}</p>
+                <SummaryOutline sections={summaryOutline} />
+              </>
+            ) : (
+              <EmptyState title="Ready for Codex" text="Generate a summary after transcript segments exist." />
+            )}
+          </div>
         </section>
 
-        <section className="panel section-panel transcript-panel" style={transcriptSyncStyle}>
+        <section className="panel section-panel transcript-panel">
           <div className="panel-title-row">
             <div>
               <p className="section-label">Transcript</p>
@@ -1221,7 +1481,7 @@ function MeetingDetailView({
                 className="secondary-action icon-only tooltip-action"
                 type="button"
                 onClick={onTranscribe}
-                disabled={busy === "transcribing" || detail.chunks.length === 0}
+                disabled={taskActive || detail.chunks.length === 0}
                 aria-label="Transcribe meeting"
                 data-tooltip="Transcribe stored audio"
                 title="Transcribe stored audio"
@@ -1232,7 +1492,7 @@ function MeetingDetailView({
                 className="secondary-action icon-only tooltip-action"
                 type="button"
                 onClick={onRetranscribe}
-                disabled={busy === "retranscribing" || detail.chunks.length === 0}
+                disabled={taskActive || detail.chunks.length === 0}
                 aria-label="Re-transcribe meeting"
                 data-tooltip="Re-transcribe and replace"
                 title="Re-transcribe and replace"
@@ -1675,8 +1935,99 @@ function parseActionItems(raw?: string | null): string[] {
   }
 }
 
+let glossaryEntrySequence = 0;
+
+function createBlankGlossaryEntry(): GlossaryEntry {
+  glossaryEntrySequence += 1;
+  return {
+    id: `glossary-${Date.now()}-${glossaryEntrySequence}`,
+    term: "",
+    description: ""
+  };
+}
+
+function parseGlossaryEntries(raw: string): GlossaryEntry[] {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const separatorIndex = findGlossarySeparator(line);
+      if (separatorIndex === -1) {
+        return {
+          ...createBlankGlossaryEntry(),
+          term: line,
+          description: ""
+        };
+      }
+      return {
+        ...createBlankGlossaryEntry(),
+        term: line.slice(0, separatorIndex).trim(),
+        description: line.slice(separatorIndex + 1).trim()
+      };
+    });
+}
+
+function findGlossarySeparator(line: string): number {
+  const colon = line.indexOf(":");
+  const fullWidthColon = line.indexOf("：");
+  if (colon === -1) return fullWidthColon;
+  if (fullWidthColon === -1) return colon;
+  return Math.min(colon, fullWidthColon);
+}
+
+function serializeGlossaryEntries(entries: GlossaryEntry[]): string {
+  return entries
+    .map((entry) => {
+      const term = entry.term.trim();
+      const description = entry.description.trim();
+      if (term && description) return `${term}: ${description}`;
+      return term || description;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function formatStatus(status: string): string {
   return status.replace(/_/g, " ");
+}
+
+function isTaskActiveStatus(status: string): boolean {
+  return ["transcribing", "summarizing", "canceling"].includes(status);
+}
+
+function isTaskBusy(busy: string | null): boolean {
+  return busy === "transcribing" || busy === "retranscribing" || busy === "summarizing" || busy === "canceling";
+}
+
+function isCancellationMessage(message: string): boolean {
+  return message.toLowerCase().includes("cancelled") || message.toLowerCase().includes("canceled");
+}
+
+function indexTaskStatuses(statuses: MeetingTaskStatus[]): Record<string, MeetingTaskStatus> {
+  return Object.fromEntries(statuses.map((status) => [status.meetingId, status]));
+}
+
+function formatTaskKind(kind: string): string {
+  if (kind === "summary") return "Summary";
+  if (kind === "transcription") return "Transcription";
+  return formatStatus(kind);
+}
+
+async function notifyTaskComplete(title: string, body: string) {
+  if (!window.__TAURI_INTERNALS__) return;
+  try {
+    const { isPermissionGranted, requestPermission, sendNotification } = await import("@tauri-apps/plugin-notification");
+    let granted = await isPermissionGranted();
+    if (!granted) {
+      granted = (await requestPermission()) === "granted";
+    }
+    if (granted) {
+      sendNotification({ title, body });
+    }
+  } catch {
+    // Notifications are helpful, but they should never block the meeting workflow.
+  }
 }
 
 function formatTimestamp(ms: number): string {
@@ -1707,6 +2058,7 @@ let mockRuntimeInstalled = true;
 let mockModelVerified = true;
 let mockSettings: AppSettings = { ...defaultSettings, recordingConsentReminderDismissed: true };
 let mockActiveRecording: ActiveRecordingStatus | null = null;
+let mockTaskStatuses: Record<string, MeetingTaskStatus> = {};
 let mockMeetings: MeetingListItem[] = [
   {
     id: "meeting-1",
@@ -1727,10 +2079,17 @@ let mockDetails: Record<string, MeetingDetail> = {
 };
 
 async function mockBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  await new Promise((resolve) => window.setTimeout(resolve, command.includes("download") ? 400 : 140));
+  seedMockTaskProgress(command, args);
+  const delay = ["transcribe_meeting_demo", "retranscribe_meeting_demo", "summarize_meeting_demo"].includes(command)
+    ? 1600
+    : command.includes("download")
+      ? 400
+      : 140;
+  await new Promise((resolve) => window.setTimeout(resolve, delay));
   if (command === "get_app_status") {
     const sidecar = mockSidecar(mockModelVerified, mockRuntimeInstalled);
     return {
+      appVersion: "0.2.1",
       appDataDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker",
       databasePath: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\note-taker.sqlite3",
       recordingsDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\recordings",
@@ -1748,6 +2107,10 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "get_app_settings") return mockSettings as T;
   if (command === "get_active_recording") return mockActiveRecording as T;
+  if (command === "list_meeting_task_statuses") return Object.values(mockTaskStatuses) as T;
+  if (command === "get_meeting_task_status") {
+    return (mockTaskStatuses[String(args?.meetingId ?? "")] ?? null) as T;
+  }
   if (command === "update_app_setting") {
     const key = String(args?.key ?? "");
     const value = String(args?.value ?? "");
@@ -1760,6 +2123,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       ...(key === "openai_transcription_model" ? { openaiTranscriptionModel: value } : {}),
       ...(key === "language_hint" ? { languageHint: value } : {}),
       ...(key === "summary_language" ? { summaryLanguage: value } : {}),
+      ...(key === "custom_glossary" ? { customGlossary: value } : {}),
       ...(key === "recording_consent_reminder_dismissed" ? { recordingConsentReminderDismissed: value === "true" } : {})
     };
     return mockSettings as T;
@@ -1827,10 +2191,21 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "transcribe_meeting_demo") {
     const id = String(args?.meetingId ?? "");
+    mockTaskStatuses[id] = {
+      meetingId: id,
+      kind: "transcription",
+      phase: "transcribing",
+      message: "Transcribing window 1 of 6",
+      current: 1,
+      total: 6,
+      percent: 16,
+      cancelRequested: false
+    };
     const detail = mockDetails[id];
     detail.transcriptSegments = makeSegments(id);
     detail.meeting.status = "transcribed";
     mockMeetings = mockMeetings.map((meeting) => meeting.id === id ? toListItem(detail) : meeting);
+    delete mockTaskStatuses[id];
     return {
       meetingId: id,
       status: "transcribed",
@@ -1845,6 +2220,16 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "retranscribe_meeting_demo") {
     const id = String(args?.meetingId ?? "");
+    mockTaskStatuses[id] = {
+      meetingId: id,
+      kind: "transcription",
+      phase: "transcribing",
+      message: "Re-transcribing window 1 of 6",
+      current: 1,
+      total: 6,
+      percent: 16,
+      cancelRequested: false
+    };
     const detail = mockDetails[id];
     detail.summary = null;
     detail.transcriptSegments = makeSegments(id).map((segment, index) => ({
@@ -1853,6 +2238,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
     }));
     detail.meeting.status = "transcribed";
     mockMeetings = mockMeetings.map((meeting) => meeting.id === id ? toListItem(detail) : meeting);
+    delete mockTaskStatuses[id];
     return {
       meetingId: id,
       status: "transcribed",
@@ -1867,11 +2253,22 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "summarize_meeting_demo") {
     const id = String(args?.meetingId ?? "");
+    mockTaskStatuses[id] = {
+      meetingId: id,
+      kind: "summary",
+      phase: "summarizing",
+      message: "Generating summary with Codex",
+      current: 2,
+      total: 4,
+      percent: 50,
+      cancelRequested: false
+    };
     const detail = mockDetails[id];
     detail.summary = makeSummary(id);
     detail.meeting.title = detail.summary.suggestedTitle;
     detail.meeting.status = "summarized";
     mockMeetings = mockMeetings.map((meeting) => meeting.id === id ? toListItem(detail) : meeting);
+    delete mockTaskStatuses[id];
     return {
       meetingId: id,
       suggestedTitle: detail.summary.suggestedTitle,
@@ -1887,6 +2284,26 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       structuredNotes: parseStructuredNotes(detail.summary.rawJson),
       detailedNotes: parseDetailedNotes(detail.summary.rawJson),
       rawJson: detail.summary.rawJson
+    } as T;
+  }
+  if (command === "cancel_meeting_task") {
+    const id = String(args?.meetingId ?? "");
+    const detail = mockDetails[id];
+    const previousStatus = detail?.meeting.status ?? "unknown";
+    const status = previousStatus === "summarizing"
+      ? "summary_cancelled"
+      : previousStatus === "transcribing" || previousStatus === "canceling"
+        ? "transcription_cancelled"
+        : previousStatus;
+    if (detail) {
+      detail.meeting.status = status;
+      mockMeetings = mockMeetings.map((meeting) => meeting.id === id ? toListItem(detail) : meeting);
+    }
+    delete mockTaskStatuses[id];
+    return {
+      meetingId: id,
+      cancelRequested: ["transcribing", "summarizing", "canceling"].includes(previousStatus),
+      status
     } as T;
   }
   if (command === "export_meeting_as_markdown" || command === "export_meeting_as_json") {
@@ -1919,6 +2336,34 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "open_sidecar_folder" || command === "open_exports_folder" || command === "open_url") return undefined as T;
   throw new Error(`Unsupported mock command: ${command}`);
+}
+
+function seedMockTaskProgress(command: string, args?: Record<string, unknown>) {
+  const id = String(args?.meetingId ?? "");
+  if (!id) return;
+  if (command === "transcribe_meeting_demo" || command === "retranscribe_meeting_demo") {
+    mockTaskStatuses[id] = {
+      meetingId: id,
+      kind: "transcription",
+      phase: "transcribing",
+      message: command === "retranscribe_meeting_demo" ? "Re-transcribing window 1 of 6" : "Transcribing window 1 of 6",
+      current: 1,
+      total: 6,
+      percent: 16,
+      cancelRequested: false
+    };
+  } else if (command === "summarize_meeting_demo") {
+    mockTaskStatuses[id] = {
+      meetingId: id,
+      kind: "summary",
+      phase: "summarizing",
+      message: "Generating summary with Codex",
+      current: 2,
+      total: 4,
+      percent: 50,
+      cancelRequested: false
+    };
+  }
 }
 
 function makeMockDetail(id: string, title: string, status: string, withSummary = true): MeetingDetail {

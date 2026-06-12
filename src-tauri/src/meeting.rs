@@ -6,6 +6,7 @@ use crate::storage::{
     update_audio_chunk_transcription_status, update_meeting_status, NewAudioChunk, NewAudioSource,
     NewMeeting, NewTranscriptSegment,
 };
+use crate::task_control::CancellationToken;
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use std::fs;
@@ -26,6 +27,10 @@ pub enum MeetingError {
     OpenAiTranscription(#[from] crate::openai_transcription::OpenAiTranscriptionError),
     #[error("Smart chunk error: {0}")]
     SmartChunk(#[from] crate::smart_chunks::SmartChunkError),
+    #[error("Task control error: {0}")]
+    TaskControl(#[from] crate::task_control::TaskControlError),
+    #[error("Task cancelled by user")]
+    Cancelled,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,10 +189,18 @@ pub fn transcribe_meeting_chunks(
     models_dir: &Path,
     transcriptions_dir: &Path,
     meeting_id: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<MeetingTranscriptionResult, MeetingError> {
     initialize_database(database_path)?;
     fs::create_dir_all(transcriptions_dir)?;
     update_meeting_status(database_path, meeting_id, "transcribing")?;
+    update_progress(
+        cancellation,
+        "preparing",
+        "Preparing transcription windows",
+        0,
+        None,
+    )?;
 
     let settings = get_app_settings(database_path)?;
     let chunks = list_audio_chunks_for_meeting(database_path, meeting_id)?;
@@ -196,6 +209,8 @@ pub fn transcribe_meeting_chunks(
     let mut segments = Vec::new();
     let mut failures = Vec::new();
     let mut empty_chunks = 0;
+    let mut processed_windows = 0;
+    let mut cancelled = false;
 
     for chunk in &chunks {
         if chunk.status == "capture_failed" {
@@ -213,6 +228,21 @@ pub fn transcribe_meeting_chunks(
     }
 
     for window in &windows {
+        if is_cancelled(cancellation) {
+            cancelled = true;
+            break;
+        }
+        update_progress(
+            cancellation,
+            "transcribing",
+            &format!(
+                "Transcribing window {} of {}",
+                processed_windows + 1,
+                windows.len()
+            ),
+            processed_windows as u32,
+            Some(windows.len() as u32),
+        )?;
         update_window_chunk_status(database_path, window, "transcribing", None)?;
         match transcribe_one_window(
             database_path,
@@ -224,10 +254,57 @@ pub fn transcribe_meeting_chunks(
             &settings.local_transcription_model,
             &settings.openai_transcription_model,
             &settings.language_hint,
+            &settings.custom_glossary,
+            cancellation,
         ) {
-            Ok(Some(segment)) => segments.push(segment),
-            Ok(None) => empty_chunks += 1,
+            Ok(Some(segment)) => {
+                processed_windows += 1;
+                update_progress(
+                    cancellation,
+                    "transcribing",
+                    &format!(
+                        "Transcribed {} of {} windows",
+                        processed_windows,
+                        windows.len()
+                    ),
+                    processed_windows as u32,
+                    Some(windows.len() as u32),
+                )?;
+                segments.push(segment);
+            }
+            Ok(None) => {
+                processed_windows += 1;
+                empty_chunks += 1;
+                update_progress(
+                    cancellation,
+                    "transcribing",
+                    &format!(
+                        "Processed {} of {} windows",
+                        processed_windows,
+                        windows.len()
+                    ),
+                    processed_windows as u32,
+                    Some(windows.len() as u32),
+                )?;
+            }
+            Err(MeetingError::Cancelled) => {
+                update_window_chunk_status(database_path, window, "captured", None)?;
+                cancelled = true;
+                break;
+            }
             Err(error) => {
+                processed_windows += 1;
+                update_progress(
+                    cancellation,
+                    "transcribing",
+                    &format!(
+                        "Processed {} of {} windows",
+                        processed_windows,
+                        windows.len()
+                    ),
+                    processed_windows as u32,
+                    Some(windows.len() as u32),
+                )?;
                 let message = error.to_string();
                 update_window_chunk_status(
                     database_path,
@@ -245,7 +322,23 @@ pub fn transcribe_meeting_chunks(
         }
     }
 
-    let status = if failures.is_empty() {
+    let status = if cancelled {
+        update_progress(
+            cancellation,
+            "cancelled",
+            "Transcription stopped",
+            processed_windows as u32,
+            Some(windows.len() as u32),
+        )?;
+        "transcription_cancelled"
+    } else if failures.is_empty() {
+        update_progress(
+            cancellation,
+            "complete",
+            "Transcription complete",
+            windows.len() as u32,
+            Some(windows.len() as u32),
+        )?;
         "transcribed"
     } else if segments.is_empty() && empty_chunks == 0 {
         "transcription_failed"
@@ -258,7 +351,7 @@ pub fn transcribe_meeting_chunks(
         meeting_id: meeting_id.to_string(),
         status: status.to_string(),
         provider: settings.transcription_provider,
-        processed_chunks: windows.len(),
+        processed_chunks: processed_windows,
         transcribed_chunks: segments.len(),
         empty_chunks,
         failed_chunks: failures.len(),
@@ -273,6 +366,7 @@ pub fn retranscribe_meeting_chunks(
     models_dir: &Path,
     transcriptions_dir: &Path,
     meeting_id: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<MeetingTranscriptionResult, MeetingError> {
     initialize_database(database_path)?;
     reset_meeting_transcription(database_path, meeting_id)?;
@@ -282,6 +376,7 @@ pub fn retranscribe_meeting_chunks(
         models_dir,
         transcriptions_dir,
         meeting_id,
+        cancellation,
     )
 }
 
@@ -295,7 +390,12 @@ fn transcribe_one_window(
     local_model: &str,
     openai_model: &str,
     language_hint: &str,
+    custom_glossary: &str,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<Option<TranscriptSegmentResult>, MeetingError> {
+    if is_cancelled(cancellation) {
+        return Err(MeetingError::Cancelled);
+    }
     let end_ms = window.started_at_ms + window.duration_ms;
     if let Some(existing) = find_transcript_segment_for_chunk(
         database_path,
@@ -321,24 +421,38 @@ fn transcribe_one_window(
 
     let output = match transcription_provider {
         "openai-api" => {
+            if is_cancelled(cancellation) {
+                return Err(MeetingError::Cancelled);
+            }
             TranscriptionOutput::from_openai(crate::openai_transcription::transcribe_audio_file(
                 transcriptions_dir,
                 Path::new(&window.path),
                 openai_model,
                 language_hint,
+                custom_glossary,
             )?)
         }
-        _ => TranscriptionOutput::from_sidecar(
-            crate::sidecar::transcribe_smoke_with_language_and_model(
+        _ => {
+            let output = crate::sidecar::transcribe_smoke_with_language_model_glossary_and_cancel(
                 sidecar_dir,
                 models_dir,
                 transcriptions_dir,
                 Path::new(&window.path),
                 language_hint,
                 local_model,
-            )?,
-        ),
+                custom_glossary,
+                cancellation,
+            )
+            .map_err(|error| match error {
+                crate::sidecar::SidecarError::Cancelled => MeetingError::Cancelled,
+                other => MeetingError::Sidecar(other),
+            })?;
+            TranscriptionOutput::from_sidecar(output)
+        }
     };
+    if is_cancelled(cancellation) {
+        return Err(MeetingError::Cancelled);
+    }
     let normalized_text = crate::text_normalization::normalize_transcript_text(
         language_hint,
         output.transcript_text.trim(),
@@ -380,6 +494,25 @@ fn transcribe_one_window(
         provider: output.provider,
         output_json_path: output.output_json_path,
     }))
+}
+
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation
+        .map(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+}
+
+fn update_progress(
+    cancellation: Option<&CancellationToken>,
+    phase: &str,
+    message: &str,
+    current: u32,
+    total: Option<u32>,
+) -> Result<(), MeetingError> {
+    if let Some(token) = cancellation {
+        token.update_progress(phase, message, current, total)?;
+    }
+    Ok(())
 }
 
 fn update_window_chunk_status(

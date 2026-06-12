@@ -1,10 +1,13 @@
+use crate::task_control::CancellationToken;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 use zip::ZipArchive;
 
@@ -62,6 +65,8 @@ pub enum SidecarError {
     MissingInput(String),
     #[error("whisper-cli failed with exit code {code:?}: {stderr}")]
     CommandFailed { code: Option<i32>, stderr: String },
+    #[error("Task cancelled by user")]
+    Cancelled,
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -224,6 +229,48 @@ pub fn transcribe_smoke_with_language_and_model(
     language_hint: &str,
     model_id: &str,
 ) -> Result<TranscriptionSmokeResult, SidecarError> {
+    transcribe_smoke_with_language_model_and_glossary(
+        sidecar_dir,
+        models_dir,
+        output_dir,
+        input_path,
+        language_hint,
+        model_id,
+        "",
+    )
+}
+
+pub fn transcribe_smoke_with_language_model_and_glossary(
+    sidecar_dir: &Path,
+    models_dir: &Path,
+    output_dir: &Path,
+    input_path: &Path,
+    language_hint: &str,
+    model_id: &str,
+    custom_glossary: &str,
+) -> Result<TranscriptionSmokeResult, SidecarError> {
+    transcribe_smoke_with_language_model_glossary_and_cancel(
+        sidecar_dir,
+        models_dir,
+        output_dir,
+        input_path,
+        language_hint,
+        model_id,
+        custom_glossary,
+        None,
+    )
+}
+
+pub fn transcribe_smoke_with_language_model_glossary_and_cancel(
+    sidecar_dir: &Path,
+    models_dir: &Path,
+    output_dir: &Path,
+    input_path: &Path,
+    language_hint: &str,
+    model_id: &str,
+    custom_glossary: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<TranscriptionSmokeResult, SidecarError> {
     fs::create_dir_all(sidecar_dir)?;
     fs::create_dir_all(models_dir)?;
     let executable_path = sidecar_dir.join(executable_name());
@@ -260,14 +307,14 @@ pub fn transcribe_smoke_with_language_and_model(
         .arg("-oj")
         .arg("-of")
         .arg(&output_prefix);
-    if let Some(prompt) = initial_prompt_for_language(language) {
+    if let Some(prompt) = transcription_prompt(language, custom_glossary) {
         command
             .arg("--prompt")
-            .arg(prompt)
+            .arg(&prompt)
             .arg("--carry-initial-prompt");
     }
     crate::process::suppress_console_window(&mut command);
-    let output = command.output()?;
+    let output = run_transcription_command(command, cancellation)?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -295,6 +342,28 @@ pub fn transcribe_smoke_with_language_and_model(
     })
 }
 
+fn run_transcription_command(
+    mut command: Command,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::process::Output, SidecarError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    loop {
+        if cancellation
+            .map(CancellationToken::is_cancelled)
+            .unwrap_or(false)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SidecarError::Cancelled);
+        }
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(SidecarError::Io);
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
 fn normalize_language_hint(language_hint: &str) -> &'static str {
     match language_hint {
         "zh" | "zh-CN" | "Chinese" | "chinese" => "zh",
@@ -310,6 +379,26 @@ fn initial_prompt_for_language(language: &str) -> Option<&'static str> {
         "ja" => Some("以下は日本語の会議文字起こしです。"),
         "en" => Some("The following is an English meeting transcript."),
         _ => None,
+    }
+}
+
+fn transcription_prompt(language: &str, custom_glossary: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(prompt) = initial_prompt_for_language(language) {
+        parts.push(prompt.to_string());
+    }
+
+    let glossary = custom_glossary.trim();
+    if !glossary.is_empty() {
+        parts.push(format!(
+            "可能出现的专有名词、缩写或内部术语:\n{glossary}\n如果音频中出现相近发音，请优先使用以上写法；不要凭空加入未听到的词。"
+        ));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
     }
 }
 
@@ -658,6 +747,16 @@ mod tests {
         assert!(text.contains("world"));
         assert!(text.contains("again"));
         assert!(!text.contains("  "));
+    }
+
+    #[test]
+    fn transcription_prompt_includes_custom_glossary() {
+        let prompt = transcription_prompt("zh", "RAG: 检索增强生成\nNote Taker")
+            .expect("prompt with glossary");
+
+        assert!(prompt.contains("普通话会议转录"));
+        assert!(prompt.contains("RAG: 检索增强生成"));
+        assert!(prompt.contains("不要凭空加入"));
     }
 
     #[test]
