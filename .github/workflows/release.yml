@@ -59,6 +59,7 @@ jobs:
           if (-not (Test-Path -LiteralPath $signaturePath)) {
             throw "No updater signature was generated for $($updaterBundle.Name)."
           }
+          $updaterAssetName = $updaterBundle.Name -replace " ", "."
 
           $manifest = @{
             version = $version
@@ -67,7 +68,7 @@ jobs:
             platforms = @{
               "windows-x86_64" = @{
                 signature = (Get-Content -Raw -LiteralPath $signaturePath).Trim()
-                url = "https://github.com/yihuil1992/note-taker/releases/download/$tag/$($updaterBundle.Name)"
+                url = "https://github.com/yihuil1992/note-taker/releases/download/$tag/$updaterAssetName"
               }
             }
           }
