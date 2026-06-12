@@ -91,6 +91,7 @@ pub fn initialize_database(path: &Path) -> Result<()> {
             ('raw_audio_retention_days', '7'),
             ('transcription_provider', 'local-whisper'),
             ('summary_provider', 'codex-cli'),
+            ('summary_model', 'gpt-5.4'),
             ('local_transcription_model', 'large-v3-turbo'),
             ('openai_transcription_model', 'gpt-4o-mini-transcribe'),
             ('language_hint', 'zh'),
@@ -123,7 +124,10 @@ fn ensure_column(
             return Ok(());
         }
     }
-    connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])?;
+    connection.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+        [],
+    )?;
     Ok(())
 }
 
@@ -249,6 +253,7 @@ pub struct AppSettingsRecord {
     pub raw_audio_retention_days: u8,
     pub transcription_provider: String,
     pub summary_provider: String,
+    pub summary_model: String,
     pub local_transcription_model: String,
     pub openai_transcription_model: String,
     pub language_hint: String,
@@ -732,6 +737,8 @@ pub fn get_app_settings(path: &Path) -> Result<AppSettingsRecord> {
         get_setting(path, "transcription_provider")?.unwrap_or_else(|| "local-whisper".to_string());
     let summary_provider =
         get_setting(path, "summary_provider")?.unwrap_or_else(|| "codex-cli".to_string());
+    let summary_model =
+        get_setting(path, "summary_model")?.unwrap_or_else(|| "gpt-5.4".to_string());
     let local_transcription_model = get_setting(path, "local_transcription_model")?
         .unwrap_or_else(|| "large-v3-turbo".to_string());
     let openai_transcription_model = get_setting(path, "openai_transcription_model")?
@@ -748,6 +755,7 @@ pub fn get_app_settings(path: &Path) -> Result<AppSettingsRecord> {
         raw_audio_retention_days,
         transcription_provider,
         summary_provider,
+        summary_model,
         local_transcription_model,
         openai_transcription_model,
         language_hint,
