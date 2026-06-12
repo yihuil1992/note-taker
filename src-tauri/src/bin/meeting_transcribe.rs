@@ -25,6 +25,7 @@ fn main() {
         &models_dir,
         &transcriptions_dir,
         &meeting_id,
+        None,
     ) {
         Ok(result) => {
             println!(

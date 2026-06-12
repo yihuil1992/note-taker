@@ -1,7 +1,7 @@
 {
   "name": "note-taker",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
@@ -9,6 +9,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "tauri:build:exe": "tauri build --no-bundle",
+    "tauri:build:installer": "tauri build",
     "typecheck": "tsc --noEmit",
     "audio:spike": "cargo run --manifest-path src-tauri/Cargo.toml --bin audio-spike --",
     "meeting:demo": "cargo run --manifest-path src-tauri/Cargo.toml --bin meeting-demo --",
@@ -22,6 +24,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/plugin-notification": "~2.3.3",
     "@tauri-apps/plugin-process": "~2.3.1",
     "@tauri-apps/plugin-updater": "~2.10.1",
     "lucide-react": "^0.468.0",

@@ -43,6 +43,7 @@ pub fn transcribe_audio_file(
     input_path: &Path,
     model: &str,
     language_hint: &str,
+    custom_glossary: &str,
 ) -> Result<OpenAiTranscriptionResult, OpenAiTranscriptionError> {
     if !input_path.exists() {
         return Err(OpenAiTranscriptionError::MissingInput(
@@ -62,8 +63,8 @@ pub fn transcribe_audio_file(
     if let Some(language) = normalize_language_hint(language_hint) {
         form = form.text("language", language.to_string());
     }
-    if let Some(prompt) = initial_prompt_for_language(language_hint) {
-        form = form.text("prompt", prompt.to_string());
+    if let Some(prompt) = transcription_prompt(language_hint, custom_glossary) {
+        form = form.text("prompt", prompt);
     }
 
     let response = reqwest::blocking::Client::new()
@@ -120,6 +121,26 @@ fn initial_prompt_for_language(language_hint: &str) -> Option<&'static str> {
     }
 }
 
+fn transcription_prompt(language_hint: &str, custom_glossary: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(prompt) = initial_prompt_for_language(language_hint) {
+        parts.push(prompt.to_string());
+    }
+
+    let glossary = custom_glossary.trim();
+    if !glossary.is_empty() {
+        parts.push(format!(
+            "可能出现的专有名词、缩写或内部术语:\n{glossary}\n如果音频中出现相近发音，请优先使用以上写法；不要凭空加入未听到的词。"
+        ));
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 fn output_path(output_dir: &Path, input_path: &Path) -> PathBuf {
     let stem = input_path
         .file_stem()
@@ -133,12 +154,27 @@ fn output_path(output_dir: &Path, input_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_model, normalize_model};
+    use super::{default_model, normalize_model, transcription_prompt};
 
     #[test]
     fn defaults_to_mini_transcribe_for_unknown_models() {
         assert_eq!(default_model(), "gpt-4o-mini-transcribe");
         assert_eq!(normalize_model("not-a-model"), "gpt-4o-mini-transcribe");
         assert_eq!(normalize_model("gpt-4o-transcribe"), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn transcription_prompt_includes_custom_glossary() {
+        let prompt = transcription_prompt("zh", "RAG: 检索增强生成\nNote Taker")
+            .expect("prompt with glossary");
+
+        assert!(prompt.contains("普通话会议转录"));
+        assert!(prompt.contains("RAG: 检索增强生成"));
+        assert!(prompt.contains("不要凭空加入"));
+    }
+
+    #[test]
+    fn transcription_prompt_stays_empty_without_language_or_glossary() {
+        assert!(transcription_prompt("auto", "").is_none());
     }
 }

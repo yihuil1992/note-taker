@@ -48,9 +48,15 @@ jobs:
           $version = $tag.TrimStart("v")
           $notes = "Signed updater bundle for Note Taker $tag. Windows installers are not code-signed yet."
           $bundleRoot = "src-tauri/target/release/bundle"
-          $updaterBundle = Get-ChildItem -Path "$bundleRoot/nsis/*.exe" | Select-Object -First 1
+          $updaterBundle = Get-ChildItem -Path "$bundleRoot/nsis/*.nsis.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $updaterBundle) {
-            $updaterBundle = Get-ChildItem -Path "$bundleRoot/msi/*.msi" | Select-Object -First 1
+            $updaterBundle = Get-ChildItem -Path "$bundleRoot/msi/*.msi.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $updaterBundle) {
+            $updaterBundle = Get-ChildItem -Path "$bundleRoot/nsis/*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $updaterBundle) {
+            $updaterBundle = Get-ChildItem -Path "$bundleRoot/msi/*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           if (-not $updaterBundle) {
             throw "No updater bundle was generated."

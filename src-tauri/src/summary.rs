@@ -1,12 +1,16 @@
 use crate::storage::{
-    initialize_database, list_transcript_segments_for_meeting, update_meeting_status,
-    update_meeting_title, upsert_meeting_summary, NewMeetingSummary, TranscriptSegmentRecord,
+    get_app_settings, initialize_database, list_transcript_segments_for_meeting,
+    update_meeting_status, update_meeting_title, upsert_meeting_summary, NewMeetingSummary,
+    TranscriptSegmentRecord,
 };
+use crate::task_control::CancellationToken;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
@@ -24,6 +28,10 @@ pub enum SummaryError {
     EmptyTranscript(String),
     #[error("Codex CLI failed with exit code {code:?}: {stderr}")]
     CodexFailed { code: Option<i32>, stderr: String },
+    #[error("Task control error: {0}")]
+    TaskControl(#[from] crate::task_control::TaskControlError),
+    #[error("Task cancelled by user")]
+    Cancelled,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,20 +149,50 @@ pub fn summarize_meeting_with_codex_model(
     meeting_id: &str,
     model: &str,
 ) -> Result<MeetingSummaryResult, SummaryError> {
+    summarize_meeting_with_codex_model_with_cancel(database_path, work_dir, meeting_id, model, None)
+}
+
+pub fn summarize_meeting_with_codex_model_with_cancel(
+    database_path: &Path,
+    work_dir: &Path,
+    meeting_id: &str,
+    model: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<MeetingSummaryResult, SummaryError> {
     initialize_database(database_path)?;
     fs::create_dir_all(work_dir)?;
+    update_progress(cancellation, "preparing", "Loading transcript", 0, Some(4))?;
+    let settings = get_app_settings(database_path)?;
     let segments = list_transcript_segments_for_meeting(database_path, meeting_id)?;
     if segments.is_empty() {
         return Err(SummaryError::EmptyTranscript(meeting_id.to_string()));
     }
 
     update_meeting_status(database_path, meeting_id, "summarizing")?;
+    update_progress(
+        cancellation,
+        "preparing",
+        "Preparing summary prompt",
+        1,
+        Some(4),
+    )?;
     let transcript = render_transcript(&segments);
     let schema_path = work_dir.join("summary.schema.json");
     let output_path = work_dir.join(format!("summary-{meeting_id}.json"));
     fs::write(&schema_path, summary_schema_json())?;
 
-    let prompt = build_summary_prompt(meeting_id, &transcript);
+    let prompt = build_summary_prompt(meeting_id, &transcript, &settings.custom_glossary);
+    if is_cancelled(cancellation) {
+        update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
+        return Err(SummaryError::Cancelled);
+    }
+    update_progress(
+        cancellation,
+        "summarizing",
+        "Generating summary with Codex",
+        2,
+        Some(4),
+    )?;
     let mut command = Command::new(codex_command_name());
     command
         .arg("exec")
@@ -178,9 +216,20 @@ pub fn summarize_meeting_with_codex_model(
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(prompt.as_bytes())?;
     }
-    let output = child.wait_with_output()?;
+    let output = match wait_for_codex_output(child, cancellation) {
+        Ok(output) => output,
+        Err(SummaryError::Cancelled) => {
+            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
+            return Err(SummaryError::Cancelled);
+        }
+        Err(error) => return Err(error),
+    };
 
     if !output.status.success() {
+        if is_cancelled(cancellation) {
+            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
+            return Err(SummaryError::Cancelled);
+        }
         update_meeting_status(database_path, meeting_id, "summary_failed")?;
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         return Err(SummaryError::CodexFailed {
@@ -189,9 +238,29 @@ pub fn summarize_meeting_with_codex_model(
         });
     }
 
+    update_progress(cancellation, "saving", "Saving summary", 3, Some(4))?;
     let raw_json = fs::read_to_string(&output_path)?;
     let summary: CodexSummary = serde_json::from_str(raw_json.trim())?;
-    persist_summary(database_path, meeting_id, model, summary, raw_json.trim())
+    let result = persist_summary(database_path, meeting_id, model, summary, raw_json.trim())?;
+    update_progress(cancellation, "complete", "Summary complete", 4, Some(4))?;
+    Ok(result)
+}
+
+fn wait_for_codex_output(
+    mut child: std::process::Child,
+    cancellation: Option<&CancellationToken>,
+) -> Result<std::process::Output, SummaryError> {
+    loop {
+        if is_cancelled(cancellation) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SummaryError::Cancelled);
+        }
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map_err(SummaryError::Io);
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
 }
 
 fn persist_summary(
@@ -264,7 +333,8 @@ fn render_transcript(segments: &[TranscriptSegmentRecord]) -> String {
         .join("\n")
 }
 
-fn build_summary_prompt(meeting_id: &str, transcript: &str) -> String {
+fn build_summary_prompt(meeting_id: &str, transcript: &str, custom_glossary: &str) -> String {
+    let glossary_section = render_glossary_section(custom_glossary);
     format!(
         r#"You are summarizing a locally captured meeting transcript.
 
@@ -301,9 +371,29 @@ Coverage check before returning JSON:
 - If a point does not fit decisions/action/openQuestions, put it in summaryOutline.
 
 Meeting id: {meeting_id}
+{glossary_section}
 
 Transcript:
 {transcript}
+"#
+    )
+}
+
+fn render_glossary_section(custom_glossary: &str) -> String {
+    let glossary = custom_glossary.trim();
+    if glossary.is_empty() {
+        return String::new();
+    }
+
+    format!(
+        r#"
+User glossary:
+{glossary}
+
+Glossary rules:
+- Prefer the glossary spelling for matching people, products, teams, projects, acronyms, and internal terms.
+- Treat explanations after ":" or "-" as context for understanding and summarizing the transcript.
+- Do not invent glossary terms that are not supported by the transcript.
 "#
     )
 }
@@ -383,6 +473,25 @@ fn truncate_for_ui(value: &str, max_chars: usize) -> String {
     let mut truncated = value.chars().take(max_chars).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation
+        .map(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+}
+
+fn update_progress(
+    cancellation: Option<&CancellationToken>,
+    phase: &str,
+    message: &str,
+    current: u32,
+    total: Option<u32>,
+) -> Result<(), SummaryError> {
+    if let Some(token) = cancellation {
+        token.update_progress(phase, message, current, total)?;
+    }
+    Ok(())
 }
 
 fn summary_schema_json() -> &'static str {
@@ -483,5 +592,23 @@ fn codex_command_name() -> &'static str {
         "codex.cmd"
     } else {
         "codex"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_summary_prompt;
+
+    #[test]
+    fn summary_prompt_includes_custom_glossary() {
+        let prompt = build_summary_prompt(
+            "meeting-1",
+            "[0:00-0:10] microphone / Me: We discussed RAG.",
+            "RAG: retrieval augmented generation\nNote Taker: project name",
+        );
+
+        assert!(prompt.contains("User glossary"));
+        assert!(prompt.contains("RAG: retrieval augmented generation"));
+        assert!(prompt.contains("Do not invent glossary terms"));
     }
 }
