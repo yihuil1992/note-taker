@@ -2,7 +2,6 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
-  Activity,
   Archive,
   ChevronDown,
   CheckCircle2,
@@ -15,7 +14,9 @@ import {
   Filter,
   FolderOpen,
   KeyRound,
+  Maximize2,
   Mic,
+  Minimize2,
   MonitorSpeaker,
   Moon,
   Play,
@@ -30,6 +31,8 @@ import {
   Trash2
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow, LogicalSize, type PhysicalSize } from "@tauri-apps/api/window";
+import appIconUrl from "./assets/app-icon.png";
 import "./styles.css";
 
 declare global {
@@ -302,6 +305,11 @@ type AppUpdateProgress = {
   phase: "downloading" | "installing" | "restarting";
 };
 
+type WindowSnapshot = {
+  size: PhysicalSize;
+  maximized: boolean;
+};
+
 type OpenAiApiKeyStatus = {
   hasKey: boolean;
   source: string;
@@ -349,6 +357,9 @@ const defaultSettings: AppSettings = {
 const RECORDING_FAILSAFE_SECONDS = 4 * 60 * 60;
 const ATLAS_MODE_STORAGE_KEY = "note-taker-atlas-mode";
 const DEFAULT_ATLAS_MODE: AtlasMode = "night";
+const FULL_WINDOW_MIN_SIZE = new LogicalSize(1100, 720);
+const MINI_WINDOW_MIN_SIZE = new LogicalSize(340, 210);
+const MINI_WINDOW_SIZE = new LogicalSize(380, 236);
 const RAW_AUDIO_RETENTION_OPTIONS: AtlasSelectOption[] = [
   { value: "0", label: "Delete after review" },
   { value: "7", label: "Keep 7 days" },
@@ -423,10 +434,12 @@ function App() {
   const [expandedGlossaryEntryId, setExpandedGlossaryEntryId] = React.useState<string | null>(null);
   const [openaiApiKeyStatus, setOpenaiApiKeyStatus] = React.useState<OpenAiApiKeyStatus | null>(null);
   const [openaiApiKeyDraft, setOpenaiApiKeyDraft] = React.useState("");
+  const [miniMode, setMiniMode] = React.useState(false);
   const glossaryDraft = React.useMemo(() => serializeGlossaryEntries(glossaryEntries), [glossaryEntries]);
   const savedGlossaryDraft = React.useMemo(() => serializeGlossaryEntries(parseGlossaryEntries(settings.customGlossary)), [settings.customGlossary]);
   const glossaryEntryCount = glossaryEntries.filter((entry) => entry.term.trim() || entry.description.trim()).length;
   const pendingUpdateRef = React.useRef<unknown>(null);
+  const miniWindowSnapshotRef = React.useRef<WindowSnapshot | null>(null);
 
   React.useEffect(() => {
     void refreshAll();
@@ -910,17 +923,76 @@ function App() {
     }
   }
 
+  async function enterMiniMode() {
+    setMiniMode(true);
+    if (!window.__TAURI_INTERNALS__) return;
+    try {
+      const appWindow = getCurrentWindow();
+      miniWindowSnapshotRef.current = {
+        size: await appWindow.outerSize(),
+        maximized: await appWindow.isMaximized()
+      };
+      if (miniWindowSnapshotRef.current.maximized) {
+        await appWindow.unmaximize();
+      }
+      await appWindow.setMinSize(MINI_WINDOW_MIN_SIZE);
+      await appWindow.setSize(MINI_WINDOW_SIZE);
+      await appWindow.setAlwaysOnTop(true);
+    } catch (miniError) {
+      setNotice(`Mini layout is active, but the window size could not be changed: ${String(miniError)}`);
+    }
+  }
+
+  async function exitMiniMode() {
+    setMiniMode(false);
+    if (!window.__TAURI_INTERNALS__) return;
+    try {
+      const appWindow = getCurrentWindow();
+      const snapshot = miniWindowSnapshotRef.current;
+      await appWindow.setAlwaysOnTop(false);
+      await appWindow.setMinSize(FULL_WINDOW_MIN_SIZE);
+      if (snapshot) {
+        await appWindow.setSize(snapshot.size);
+        if (snapshot.maximized) {
+          await appWindow.maximize();
+        }
+      }
+      miniWindowSnapshotRef.current = null;
+    } catch (restoreError) {
+      setNotice(`Restored the full layout, but the window size could not be reset: ${String(restoreError)}`);
+    }
+  }
+
   const inputDevice = devices.find((device) => device.kind === "input" && device.isDefault) ?? devices.find((device) => device.kind === "input");
   const outputDevice = devices.find((device) => device.kind === "output" && device.isDefault) ?? devices.find((device) => device.kind === "output");
   const setupReady = settings.transcriptionProvider === "openai-api" || Boolean(status?.sidecar.ready);
   const selectedMeeting = detail?.meeting;
   const atlasModeLabel = atlasMode === "archive" ? "Archive Sheet" : "Night Atlas";
 
+  if (miniMode) {
+    return (
+      <MiniRecordingShell
+        busy={busy}
+        activeRecording={activeRecording}
+        consentRequired={!settings.recordingConsentReminderDismissed && !consentAccepted}
+        inputDevice={inputDevice}
+        outputDevice={outputDevice}
+        providerLabel={settings.transcriptionProvider === "openai-api" ? "OpenAI transcription" : setupReady ? "Local transcription ready" : "Local setup needed"}
+        cloudTranscriptionSelected={settings.transcriptionProvider === "openai-api"}
+        error={error}
+        onRecord={() => void startRecording(false)}
+        onStop={() => void stopRecording()}
+        onConsentRecord={() => void dismissConsentAndRecord()}
+        onRestore={() => void exitMiniMode()}
+      />
+    );
+  }
+
   return (
     <main className="atlas-shell">
       <header className="atlas-header">
         <a className="atlas-brand" href="#today" aria-label="Note Taker home">
-          <span className="brand-mark"><Activity size={20} aria-hidden="true" /></span>
+          <span className="brand-mark"><img src={appIconUrl} alt="" aria-hidden="true" /></span>
           <span>
             <strong>Note Taker</strong>
             <small>Meeting memory</small>
@@ -946,6 +1018,10 @@ function App() {
           </button>
           <button className="ghost-action" type="button" onClick={() => void refreshAll()} aria-label="Refresh status">
             <RefreshCw size={15} aria-hidden="true" />
+          </button>
+          <button className="ghost-action" type="button" onClick={() => void enterMiniMode()} aria-label="Switch to mini recording mode">
+            <Minimize2 size={15} aria-hidden="true" />
+            Mini
           </button>
         </div>
       </header>
@@ -1049,6 +1125,7 @@ function App() {
             onStop={() => void stopRecording()}
             onConsentRecord={() => void dismissConsentAndRecord()}
             onChunkSecondsChange={setChunkSeconds}
+            onMini={() => void enterMiniMode()}
           />
 
           {settings.transcriptionProvider === "local-whisper" && !setupReady ? (
@@ -1312,7 +1389,7 @@ function App() {
       <footer className="atlas-footer">
         <span className="privacy-dot" />
         <strong>{settings.transcriptionProvider === "openai-api" ? "Cloud transcription on" : "Local by default"}</strong>
-        <span className="version-pill">v{status?.appVersion ?? "0.2.3"}</span>
+        <span className="version-pill">v{status?.appVersion ?? "0.2.4"}</span>
         <span>{settings.transcriptionProvider === "openai-api" ? "Audio windows are sent to OpenAI for transcription." : "Audio and transcripts stay on this device unless you choose cloud transcription."}</span>
         <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
           <RefreshCw size={14} aria-hidden="true" />
@@ -1335,7 +1412,8 @@ function RecordingPanel({
   onRecord,
   onStop,
   onConsentRecord,
-  onChunkSecondsChange
+  onChunkSecondsChange,
+  onMini
 }: {
   busy: string | null;
   activeRecording: ActiveRecordingStatus | null;
@@ -1348,6 +1426,7 @@ function RecordingPanel({
   onStop: () => void;
   onConsentRecord: () => void;
   onChunkSecondsChange: (seconds: number) => void;
+  onMini: () => void;
 }) {
   return (
     <section id="record" className="capture-console">
@@ -1376,6 +1455,10 @@ function RecordingPanel({
           <span>Capture chunks</span>
           <AtlasSelect value={String(chunkSeconds)} options={CHUNK_SECONDS_OPTIONS} onChange={(value) => onChunkSecondsChange(Number(value))} />
         </div>
+        <button className="ghost-action mini-mode-action" type="button" onClick={onMini}>
+          <Minimize2 size={15} aria-hidden="true" />
+          Mini recorder
+        </button>
       </div>
 
       {activeRecording ? (
@@ -1398,6 +1481,82 @@ function RecordingPanel({
       ) : null}
 
     </section>
+  );
+}
+
+function MiniRecordingShell({
+  busy,
+  activeRecording,
+  consentRequired,
+  inputDevice,
+  outputDevice,
+  providerLabel,
+  cloudTranscriptionSelected,
+  error,
+  onRecord,
+  onStop,
+  onConsentRecord,
+  onRestore
+}: {
+  busy: string | null;
+  activeRecording: ActiveRecordingStatus | null;
+  consentRequired: boolean;
+  inputDevice?: AudioDevice;
+  outputDevice?: AudioDevice;
+  providerLabel: string;
+  cloudTranscriptionSelected: boolean;
+  error: string | null;
+  onRecord: () => void;
+  onStop: () => void;
+  onConsentRecord: () => void;
+  onRestore: () => void;
+}) {
+  const actionDisabled = busy === "recording" || busy === "stopping";
+  const actionLabel = activeRecording
+    ? busy === "stopping" ? "Stopping..." : "Stop"
+    : busy === "recording" ? "Starting..." : "Start";
+  const actionHandler = activeRecording ? onStop : consentRequired ? onConsentRecord : onRecord;
+  const sourceLabel = `${inputDevice?.name ?? "Microphone"} + ${outputDevice?.name ?? "System audio"}`;
+
+  return (
+    <main className="mini-shell" aria-label="Mini recorder">
+      <header className="mini-header">
+        <span className={activeRecording ? "mini-live-dot recording" : "mini-live-dot"} />
+        <div>
+          <strong>{activeRecording ? "Recording" : "Ready"}</strong>
+          <span>{providerLabel}</span>
+        </div>
+        <button className="icon-button tooltip-action" data-tooltip="Restore full window" type="button" onClick={onRestore} aria-label="Restore full window">
+          <Maximize2 size={16} aria-hidden="true" />
+        </button>
+      </header>
+
+      <section className="mini-session">
+        <strong>{activeRecording?.title ?? "New meeting"}</strong>
+        <span>
+          {activeRecording
+            ? `${activeRecording.capturedChunks} chunks · ${activeRecording.chunkSeconds}s cadence`
+            : cloudTranscriptionSelected
+              ? "Cloud transcription selected"
+              : "Local recording path"}
+        </span>
+        <small>{activeRecording ? `Started ${formatDateTime(activeRecording.startedAt)}` : sourceLabel}</small>
+      </section>
+
+      {error ? <div className="mini-alert error">{error}</div> : null}
+
+      <div className="mini-actions">
+        <button
+          className={activeRecording ? "danger-action record-button" : "primary-action record-button"}
+          type="button"
+          onClick={actionHandler}
+          disabled={actionDisabled}
+        >
+          {activeRecording ? <Square size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+          {consentRequired && !activeRecording ? "Consent and start" : actionLabel}
+        </button>
+      </div>
+    </main>
   );
 }
 
@@ -2193,7 +2352,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   if (command === "get_app_status") {
     const sidecar = mockSidecar(mockModelVerified, mockRuntimeInstalled);
     return {
-      appVersion: "0.2.3",
+      appVersion: "0.2.4",
       appDataDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker",
       databasePath: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\note-taker.sqlite3",
       recordingsDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\recordings",
@@ -2439,12 +2598,12 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "check_for_app_update") {
     return {
-      currentVersion: "0.2.3",
-      latestVersion: "v0.2.3",
+      currentVersion: "0.2.4",
+      latestVersion: "v0.2.4",
       updateAvailable: false,
       installable: false,
-      releaseName: "Note Taker v0.2.3",
-      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.3",
+      releaseName: "Note Taker v0.2.4",
+      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.4",
       publishedAt: "2026-06-12T22:47:08Z",
       notes: "You are running the latest release."
     } as T;

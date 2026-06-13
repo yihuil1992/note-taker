@@ -3,5 +3,17 @@
   "identifier": "main-capability",
   "description": "Capability for the main application window",
   "windows": ["main"],
-  "permissions": ["core:default", "updater:default", "process:default", "notification:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-is-maximized",
+    "core:window:allow-maximize",
+    "core:window:allow-outer-size",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-set-min-size",
+    "core:window:allow-set-size",
+    "core:window:allow-unmaximize",
+    "updater:default",
+    "process:default",
+    "notification:default"
+  ]
 }
