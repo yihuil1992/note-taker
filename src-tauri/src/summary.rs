@@ -5,16 +5,18 @@ use crate::storage::{
 };
 use crate::task_control::CancellationToken;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const SUMMARY_PROVIDER: &str = "codex-cli";
+const SUSPICIOUS_BOUNDARY_MAX_GAP_MS: i64 = 1_500;
 
 #[derive(Debug, Error)]
 pub enum SummaryError {
@@ -69,6 +71,36 @@ pub struct CodexSummary {
     pub structured_notes: Vec<StructuredNote>,
     #[serde(default)]
     pub detailed_notes: Vec<DetailedNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptNormalization {
+    pub normalized_segments: Vec<NormalizedTranscriptSegment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedTranscriptSegment {
+    pub operation: String,
+    pub source_segment_ids: Vec<String>,
+    pub source_kind: String,
+    pub speaker_label: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptNormalizationInputSegment<'a> {
+    id: &'a str,
+    source_kind: &'a str,
+    speaker_label: &'a str,
+    start_ms: i64,
+    end_ms: i64,
+    text: &'a str,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,7 +193,7 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
 ) -> Result<MeetingSummaryResult, SummaryError> {
     initialize_database(database_path)?;
     fs::create_dir_all(work_dir)?;
-    update_progress(cancellation, "preparing", "Loading transcript", 0, Some(4))?;
+    update_progress(cancellation, "preparing", "Loading transcript", 0, Some(6))?;
     let settings = get_app_settings(database_path)?;
     let segments = list_transcript_segments_for_meeting(database_path, meeting_id)?;
     if segments.is_empty() {
@@ -171,12 +203,38 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
     update_meeting_status(database_path, meeting_id, "summarizing")?;
     update_progress(
         cancellation,
+        "normalizing",
+        "Preparing transcript cleanup",
+        1,
+        Some(6),
+    )?;
+    let normalization = match normalize_transcript_with_codex(
+        work_dir,
+        meeting_id,
+        &segments,
+        model,
+        &settings.custom_glossary,
+        cancellation,
+    ) {
+        Ok(normalization) => normalization,
+        Err(SummaryError::Cancelled) => {
+            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
+            return Err(SummaryError::Cancelled);
+        }
+        Err(error) => {
+            update_meeting_status(database_path, meeting_id, "summary_failed")?;
+            return Err(error);
+        }
+    };
+
+    update_progress(
+        cancellation,
         "preparing",
         "Preparing summary prompt",
-        1,
-        Some(4),
+        3,
+        Some(6),
     )?;
-    let transcript = render_transcript(&segments);
+    let transcript = render_normalized_transcript(&normalization.normalized_segments);
     let schema_path = work_dir.join("summary.schema.json");
     let output_path = work_dir.join(format!("summary-{meeting_id}.json"));
     fs::write(&schema_path, summary_schema_json())?;
@@ -190,9 +248,77 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
         cancellation,
         "summarizing",
         "Generating summary with Codex",
-        2,
-        Some(4),
+        4,
+        Some(6),
     )?;
+    match run_codex_json(model, &schema_path, &output_path, &prompt, cancellation) {
+        Ok(()) => {}
+        Err(SummaryError::Cancelled) => {
+            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
+            return Err(SummaryError::Cancelled);
+        }
+        Err(error) => {
+            update_meeting_status(database_path, meeting_id, "summary_failed")?;
+            return Err(error);
+        }
+    }
+
+    update_progress(cancellation, "saving", "Saving summary", 5, Some(6))?;
+    let raw_json = fs::read_to_string(&output_path)?;
+    let summary: CodexSummary = serde_json::from_str(raw_json.trim())?;
+    let raw_json = attach_transcript_normalization(raw_json.trim(), &normalization)?;
+    let result = persist_summary(database_path, meeting_id, model, summary, &raw_json)?;
+    update_progress(cancellation, "complete", "Summary complete", 6, Some(6))?;
+    Ok(result)
+}
+
+fn normalize_transcript_with_codex(
+    work_dir: &Path,
+    meeting_id: &str,
+    segments: &[TranscriptSegmentRecord],
+    model: &str,
+    custom_glossary: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<TranscriptNormalization, SummaryError> {
+    let candidate_segments = suspicious_normalization_segments(segments);
+    if candidate_segments.is_empty() {
+        return Ok(raw_segments_as_normalization(segments));
+    }
+
+    let schema_path = work_dir.join("transcript-normalization.schema.json");
+    let output_path = work_dir.join(format!("transcript-normalization-{meeting_id}.json"));
+    fs::write(&schema_path, transcript_normalization_schema_json())?;
+    let prompt =
+        build_transcript_normalization_prompt(meeting_id, &candidate_segments, custom_glossary)?;
+
+    update_progress(
+        cancellation,
+        "normalizing",
+        &format!(
+            "Cleaning {} suspicious transcript segments with Codex",
+            candidate_segments.len()
+        ),
+        2,
+        Some(6),
+    )?;
+    run_codex_json(model, &schema_path, &output_path, &prompt, cancellation)?;
+
+    let raw_json = fs::read_to_string(&output_path)?;
+    let normalization: TranscriptNormalization = serde_json::from_str(raw_json.trim())?;
+    Ok(sanitize_partial_transcript_normalization(
+        normalization,
+        segments,
+        &candidate_segments,
+    ))
+}
+
+fn run_codex_json(
+    model: &str,
+    schema_path: &Path,
+    output_path: &Path,
+    prompt: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), SummaryError> {
     let mut command = Command::new(codex_command_name());
     command
         .arg("exec")
@@ -200,12 +326,13 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
         .arg(model)
         .arg("--skip-git-repo-check")
         .arg("--ephemeral")
+        .arg("--ignore-user-config")
         .arg("--sandbox")
         .arg("read-only")
         .arg("--output-schema")
-        .arg(&schema_path)
+        .arg(schema_path)
         .arg("--output-last-message")
-        .arg(&output_path)
+        .arg(output_path)
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -216,51 +343,77 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(prompt.as_bytes())?;
     }
-    let output = match wait_for_codex_output(child, cancellation) {
-        Ok(output) => output,
-        Err(SummaryError::Cancelled) => {
-            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
-            return Err(SummaryError::Cancelled);
-        }
-        Err(error) => return Err(error),
-    };
-
-    if !output.status.success() {
-        if is_cancelled(cancellation) {
-            update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
-            return Err(SummaryError::Cancelled);
-        }
-        update_meeting_status(database_path, meeting_id, "summary_failed")?;
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(SummaryError::CodexFailed {
-            code: output.status.code(),
-            stderr: summarize_codex_stderr(&stderr),
-        });
+    let output = wait_for_codex_output(child, cancellation)?;
+    if output.status.success() {
+        return Ok(());
     }
-
-    update_progress(cancellation, "saving", "Saving summary", 3, Some(4))?;
-    let raw_json = fs::read_to_string(&output_path)?;
-    let summary: CodexSummary = serde_json::from_str(raw_json.trim())?;
-    let result = persist_summary(database_path, meeting_id, model, summary, raw_json.trim())?;
-    update_progress(cancellation, "complete", "Summary complete", 4, Some(4))?;
-    Ok(result)
+    if is_cancelled(cancellation) {
+        return Err(SummaryError::Cancelled);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    Err(SummaryError::CodexFailed {
+        code: output.status.code(),
+        stderr: summarize_codex_stderr(&stderr),
+    })
 }
 
 fn wait_for_codex_output(
     mut child: std::process::Child,
     cancellation: Option<&CancellationToken>,
-) -> Result<std::process::Output, SummaryError> {
-    loop {
+) -> Result<Output, SummaryError> {
+    let mut stdout_reader = child.stdout.take().map(read_pipe_in_background);
+    let mut stderr_reader = child.stderr.take().map(read_pipe_in_background);
+
+    let status = loop {
         if is_cancelled(cancellation) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = collect_pipe_reader(stdout_reader.take());
+            let _ = collect_pipe_reader(stderr_reader.take());
             return Err(SummaryError::Cancelled);
         }
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map_err(SummaryError::Io);
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         thread::sleep(Duration::from_millis(150));
-    }
+    };
+
+    let stdout = collect_pipe_reader(stdout_reader)?;
+    let stderr = collect_pipe_reader(stderr_reader)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_pipe_in_background<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn collect_pipe_reader(
+    reader: Option<thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, SummaryError> {
+    let Some(reader) = reader else {
+        return Ok(Vec::new());
+    };
+
+    reader
+        .join()
+        .map_err(|_| {
+            SummaryError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "failed to join Codex output reader thread",
+            ))
+        })?
+        .map_err(SummaryError::Io)
 }
 
 fn persist_summary(
@@ -316,7 +469,319 @@ fn persist_summary(
     })
 }
 
-fn render_transcript(segments: &[TranscriptSegmentRecord]) -> String {
+fn build_transcript_normalization_prompt(
+    meeting_id: &str,
+    segments: &[&TranscriptSegmentRecord],
+    custom_glossary: &str,
+) -> Result<String, SummaryError> {
+    let glossary_section = render_glossary_section(custom_glossary);
+    let input_segments = segments
+        .iter()
+        .map(|segment| TranscriptNormalizationInputSegment {
+            id: &segment.id,
+            source_kind: &segment.source_kind,
+            speaker_label: &segment.speaker_label,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            text: &segment.text,
+        })
+        .collect::<Vec<_>>();
+    let input_json = serde_json::to_string_pretty(&input_segments)?;
+    Ok(format!(
+        r#"You are cleaning suspicious transcript segment boundaries before meeting summarization.
+
+Return valid JSON matching the provided schema.
+
+Goal:
+- Produce normalizedSegments for ONLY the suspicious local segment set below.
+- The rest of the meeting transcript will be preserved by the app without being sent here.
+- The returned normalizedSegments should read as natural sentences or short utterances.
+- You may keep, merge, or split boundaries.
+- This is boundary cleanup only. Do not summarize, translate, paraphrase, correct factual content, or invent missing words.
+
+Rules:
+- Preserve the original transcript wording as much as possible. Only trim extra whitespace at boundaries.
+- Keep every substantive word from the input. Do not drop asides, corrections, examples, or partial terms.
+- Cover every provided source segment id exactly once, either by keeping it, merging it with adjacent provided segments, or splitting it into multiple normalizedSegments.
+- Use operation "keep" when one source segment is already a natural sentence/utterance.
+- Use operation "merge" when adjacent segments from the same sourceKind and speakerLabel are clearly one unfinished sentence or thought.
+- Use operation "split" when one source segment clearly contains two or more natural sentences/utterances.
+- Do not merge across different sourceKind or speakerLabel values.
+- Keep normalizedSegments in chronological order.
+- Use sourceSegmentIds to identify the raw segment or adjacent raw segments that produced each normalized segment.
+- For split segments, repeat the same sourceSegmentIds entry and estimate startMs/endMs within the raw segment range.
+- For merge segments, startMs should be the first source segment startMs and endMs should be the last source segment endMs.
+- If uncertain whether a boundary is wrong, keep the source segment unchanged.
+- reason should be short and describe the boundary decision.
+{glossary_section}
+
+Meeting id: {meeting_id}
+
+Suspicious transcript segments JSON:
+{input_json}
+"#
+    ))
+}
+
+fn suspicious_normalization_segments(
+    segments: &[TranscriptSegmentRecord],
+) -> Vec<&TranscriptSegmentRecord> {
+    let mut candidate_ids = HashSet::<&str>::new();
+    for pair in segments.windows(2) {
+        let left = &pair[0];
+        let right = &pair[1];
+        if is_suspicious_boundary(left, right) {
+            candidate_ids.insert(left.id.as_str());
+            candidate_ids.insert(right.id.as_str());
+        }
+    }
+
+    segments
+        .iter()
+        .filter(|segment| candidate_ids.contains(segment.id.as_str()))
+        .collect()
+}
+
+fn is_suspicious_boundary(left: &TranscriptSegmentRecord, right: &TranscriptSegmentRecord) -> bool {
+    if left.source_kind != right.source_kind
+        || left.speaker_label != right.speaker_label
+        || left.provider != right.provider
+        || left.language != right.language
+    {
+        return false;
+    }
+    let gap_ms = right.start_ms - left.end_ms;
+    if gap_ms.abs() > SUSPICIOUS_BOUNDARY_MAX_GAP_MS {
+        return false;
+    }
+    !has_sentence_boundary(&left.text)
+}
+
+fn has_sentence_boundary(text: &str) -> bool {
+    text.trim_end()
+        .chars()
+        .last()
+        .map(|character| matches!(character, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn sanitize_transcript_normalization(
+    normalization: TranscriptNormalization,
+    raw_segments: &[TranscriptSegmentRecord],
+) -> TranscriptNormalization {
+    let mut normalized_segments =
+        validate_normalized_segments(normalization.normalized_segments, raw_segments);
+    if normalized_segments.is_empty() {
+        return raw_segments_as_normalization(raw_segments);
+    }
+
+    normalized_segments.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
+    TranscriptNormalization {
+        normalized_segments,
+    }
+}
+
+fn sanitize_partial_transcript_normalization(
+    normalization: TranscriptNormalization,
+    raw_segments: &[TranscriptSegmentRecord],
+    candidate_segments: &[&TranscriptSegmentRecord],
+) -> TranscriptNormalization {
+    let candidate_ids = candidate_segments
+        .iter()
+        .map(|segment| segment.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut normalized_segments =
+        validate_normalized_segments(normalization.normalized_segments, raw_segments)
+            .into_iter()
+            .filter(|segment| {
+                !segment.source_segment_ids.is_empty()
+                    && segment
+                        .source_segment_ids
+                        .iter()
+                        .all(|id| candidate_ids.contains(id.as_str()))
+            })
+            .collect::<Vec<_>>();
+    if normalized_segments.is_empty() {
+        return raw_segments_as_normalization(raw_segments);
+    }
+
+    normalized_segments.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
+    merge_partial_normalization(raw_segments, normalized_segments)
+}
+
+fn validate_normalized_segments(
+    segments: Vec<NormalizedTranscriptSegment>,
+    raw_segments: &[TranscriptSegmentRecord],
+) -> Vec<NormalizedTranscriptSegment> {
+    let id_map = raw_segments
+        .iter()
+        .map(|segment| (segment.id.as_str(), segment))
+        .collect::<HashMap<_, _>>();
+    let id_index = raw_segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| (segment.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut normalized_segments = Vec::new();
+
+    for segment in segments {
+        let mut source_segment_ids = Vec::new();
+        let mut source_records = Vec::new();
+        for id in &segment.source_segment_ids {
+            if source_segment_ids.iter().any(|existing| existing == id) {
+                continue;
+            }
+            let Some(source) = id_map.get(id.as_str()) else {
+                continue;
+            };
+            source_segment_ids.push(id.clone());
+            source_records.push(*source);
+        }
+        let Some(first_source) = source_records.first() else {
+            continue;
+        };
+        if source_records.iter().any(|source| {
+            source.source_kind != first_source.source_kind
+                || source.speaker_label != first_source.speaker_label
+        }) {
+            continue;
+        }
+        let source_indices = source_segment_ids
+            .iter()
+            .filter_map(|id| id_index.get(id.as_str()).copied())
+            .collect::<Vec<_>>();
+        let Some(min_index) = source_indices.iter().min().copied() else {
+            continue;
+        };
+        let Some(max_index) = source_indices.iter().max().copied() else {
+            continue;
+        };
+        if max_index - min_index + 1 != source_indices.len() {
+            continue;
+        }
+        source_segment_ids
+            .sort_by_key(|id| id_index.get(id.as_str()).copied().unwrap_or(usize::MAX));
+
+        let min_start = source_records
+            .iter()
+            .map(|source| source.start_ms)
+            .min()
+            .unwrap_or(first_source.start_ms);
+        let max_end = source_records
+            .iter()
+            .map(|source| source.end_ms)
+            .max()
+            .unwrap_or(first_source.end_ms);
+        if max_end <= min_start {
+            continue;
+        }
+
+        let mut start_ms = segment.start_ms.clamp(min_start, max_end - 1);
+        let mut end_ms = segment.end_ms.clamp(start_ms + 1, max_end);
+        if end_ms <= start_ms {
+            start_ms = min_start;
+            end_ms = max_end;
+        }
+
+        let text = compact_whitespace(&segment.text);
+        if text.is_empty() {
+            continue;
+        }
+        let operation = match segment.operation.as_str() {
+            "keep" | "merge" | "split" => segment.operation,
+            _ => "keep".to_string(),
+        };
+        normalized_segments.push(NormalizedTranscriptSegment {
+            operation,
+            source_segment_ids,
+            source_kind: first_source.source_kind.clone(),
+            speaker_label: first_source.speaker_label.clone(),
+            start_ms,
+            end_ms,
+            text,
+            reason: truncate_for_ui(&compact_whitespace(&segment.reason), 240),
+        });
+    }
+
+    normalized_segments
+}
+
+fn merge_partial_normalization(
+    raw_segments: &[TranscriptSegmentRecord],
+    normalized_segments: Vec<NormalizedTranscriptSegment>,
+) -> TranscriptNormalization {
+    let id_index = raw_segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| (segment.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut replacements: HashMap<String, Vec<NormalizedTranscriptSegment>> = HashMap::new();
+    let mut covered_ids = HashSet::<String>::new();
+
+    for segment in normalized_segments {
+        let Some(first_id) = segment
+            .source_segment_ids
+            .iter()
+            .min_by_key(|id| id_index.get(id.as_str()).copied().unwrap_or(usize::MAX))
+            .cloned()
+        else {
+            continue;
+        };
+        for id in &segment.source_segment_ids {
+            covered_ids.insert(id.clone());
+        }
+        replacements.entry(first_id).or_default().push(segment);
+    }
+
+    let mut merged = Vec::new();
+    for raw in raw_segments {
+        if let Some(mut replacement) = replacements.remove(&raw.id) {
+            replacement.sort_by_key(|segment| (segment.start_ms, segment.end_ms));
+            merged.extend(replacement);
+            continue;
+        }
+        if covered_ids.contains(&raw.id) {
+            continue;
+        }
+        merged.push(NormalizedTranscriptSegment {
+            operation: "keep".to_string(),
+            source_segment_ids: vec![raw.id.clone()],
+            source_kind: raw.source_kind.clone(),
+            speaker_label: raw.speaker_label.clone(),
+            start_ms: raw.start_ms,
+            end_ms: raw.end_ms,
+            text: compact_whitespace(&raw.text),
+            reason: "Original ASR segment preserved.".to_string(),
+        });
+    }
+
+    TranscriptNormalization {
+        normalized_segments: merged,
+    }
+}
+
+fn raw_segments_as_normalization(
+    raw_segments: &[TranscriptSegmentRecord],
+) -> TranscriptNormalization {
+    TranscriptNormalization {
+        normalized_segments: raw_segments
+            .iter()
+            .map(|segment| NormalizedTranscriptSegment {
+                operation: "keep".to_string(),
+                source_segment_ids: vec![segment.id.clone()],
+                source_kind: segment.source_kind.clone(),
+                speaker_label: segment.speaker_label.clone(),
+                start_ms: segment.start_ms,
+                end_ms: segment.end_ms,
+                text: compact_whitespace(&segment.text),
+                reason: "Original ASR segment preserved.".to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn render_normalized_transcript(segments: &[NormalizedTranscriptSegment]) -> String {
     segments
         .iter()
         .map(|segment| {
@@ -333,6 +798,24 @@ fn render_transcript(segments: &[TranscriptSegmentRecord]) -> String {
         .join("\n")
 }
 
+fn compact_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn attach_transcript_normalization(
+    raw_summary_json: &str,
+    normalization: &TranscriptNormalization,
+) -> Result<String, SummaryError> {
+    let mut value: serde_json::Value = serde_json::from_str(raw_summary_json)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "transcriptNormalization".to_string(),
+            serde_json::to_value(normalization)?,
+        );
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
 fn build_summary_prompt(meeting_id: &str, transcript: &str, custom_glossary: &str) -> String {
     let glossary_section = render_glossary_section(custom_glossary);
     format!(
@@ -347,6 +830,7 @@ Goal:
 
 Rules:
 - The summary language should be Simplified Chinese when the meeting is mixed-language or unclear.
+- The transcript has already passed a boundary-normalization step. Treat each line as the best available transcript segment, while still tolerating minor ASR errors.
 - The overview should be concise. summaryOutline is the comprehensive user-facing meeting record.
 - Organize summaryOutline as a hierarchy: first-level sections are major meeting themes, and each section contains concrete child points that can be expanded for detail.
 - Example structure: "房间占用" -> "房间用户识别目标", "以 PI 作为房间官方归属"; "research report 优化" -> "people 新增两类", "分成 3 个大区".
@@ -494,6 +978,40 @@ fn update_progress(
     Ok(())
 }
 
+fn transcript_normalization_schema_json() -> &'static str {
+    r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "normalizedSegments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": ["keep", "merge", "split"]
+          },
+          "sourceSegmentIds": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "sourceKind": { "type": "string" },
+          "speakerLabel": { "type": "string" },
+          "startMs": { "type": "integer" },
+          "endMs": { "type": "integer" },
+          "text": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["operation", "sourceSegmentIds", "sourceKind", "speakerLabel", "startMs", "endMs", "text", "reason"]
+      }
+    }
+  },
+  "required": ["normalizedSegments"]
+}"#
+}
+
 fn summary_schema_json() -> &'static str {
     r#"{
   "type": "object",
@@ -597,7 +1115,28 @@ fn codex_command_name() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::build_summary_prompt;
+    use super::*;
+
+    fn transcript_segment(
+        id: &str,
+        source_kind: &str,
+        speaker_label: &str,
+        start_ms: i64,
+        end_ms: i64,
+        text: &str,
+    ) -> TranscriptSegmentRecord {
+        TranscriptSegmentRecord {
+            id: id.to_string(),
+            meeting_id: "meeting-1".to_string(),
+            source_kind: source_kind.to_string(),
+            speaker_label: speaker_label.to_string(),
+            language: "auto".to_string(),
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+            provider: "openai-api:gpt-4o-transcribe".to_string(),
+        }
+    }
 
     #[test]
     fn summary_prompt_includes_custom_glossary() {
@@ -610,5 +1149,176 @@ mod tests {
         assert!(prompt.contains("User glossary"));
         assert!(prompt.contains("RAG: retrieval augmented generation"));
         assert!(prompt.contains("Do not invent glossary terms"));
+    }
+
+    #[test]
+    fn transcript_normalization_prompt_allows_keep_merge_and_split() {
+        let segment = transcript_segment(
+            "segment-a",
+            "microphone",
+            "Me",
+            0,
+            4_000,
+            "第一句。第二句。",
+        );
+        let segments = vec![&segment];
+
+        let prompt = build_transcript_normalization_prompt("meeting-1", &segments, "")
+            .expect("build normalization prompt");
+
+        assert!(prompt.contains("keep, merge, or split"));
+        assert!(prompt.contains("Use operation \"merge\""));
+        assert!(prompt.contains("Use operation \"split\""));
+        assert!(prompt.contains("\"segment-a\""));
+    }
+
+    #[test]
+    fn suspicious_normalization_segments_only_selects_boundary_candidates() {
+        let raw_segments = vec![
+            transcript_segment("segment-a", "microphone", "Me", 0, 4_000, "完整一句。"),
+            transcript_segment("segment-b", "microphone", "Me", 5_000, 8_000, "这个是"),
+            transcript_segment("segment-c", "microphone", "Me", 8_200, 12_000, "后半句。"),
+            transcript_segment("segment-d", "system", "Others", 12_300, 16_000, "另一人。"),
+        ];
+
+        let candidates = suspicious_normalization_segments(&raw_segments);
+        let ids = candidates
+            .into_iter()
+            .map(|segment| segment.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["segment-b", "segment-c"]);
+    }
+
+    #[test]
+    fn sanitize_transcript_normalization_rejects_cross_source_merge() {
+        let raw_segments = vec![
+            transcript_segment("segment-a", "microphone", "Me", 0, 4_000, "我先说这个"),
+            transcript_segment("segment-b", "system", "Others", 4_000, 8_000, "对方回答"),
+        ];
+        let normalization = TranscriptNormalization {
+            normalized_segments: vec![NormalizedTranscriptSegment {
+                operation: "merge".to_string(),
+                source_segment_ids: vec!["segment-a".to_string(), "segment-b".to_string()],
+                source_kind: "microphone".to_string(),
+                speaker_label: "Me".to_string(),
+                start_ms: 0,
+                end_ms: 8_000,
+                text: "我先说这个 对方回答".to_string(),
+                reason: "bad cross-source merge".to_string(),
+            }],
+        };
+
+        let sanitized = sanitize_transcript_normalization(normalization, &raw_segments);
+
+        assert_eq!(sanitized.normalized_segments.len(), 2);
+        assert!(sanitized
+            .normalized_segments
+            .iter()
+            .all(|segment| segment.operation == "keep"));
+        assert_eq!(
+            sanitized.normalized_segments[0].source_segment_ids,
+            vec!["segment-a"]
+        );
+        assert_eq!(
+            sanitized.normalized_segments[1].source_segment_ids,
+            vec!["segment-b"]
+        );
+    }
+
+    #[test]
+    fn sanitize_transcript_normalization_rejects_non_adjacent_merge() {
+        let raw_segments = vec![
+            transcript_segment("segment-a", "microphone", "Me", 0, 4_000, "第一段"),
+            transcript_segment("segment-b", "microphone", "Me", 4_000, 8_000, "中间段"),
+            transcript_segment("segment-c", "microphone", "Me", 8_000, 12_000, "第三段"),
+        ];
+        let normalization = TranscriptNormalization {
+            normalized_segments: vec![NormalizedTranscriptSegment {
+                operation: "merge".to_string(),
+                source_segment_ids: vec!["segment-a".to_string(), "segment-c".to_string()],
+                source_kind: "microphone".to_string(),
+                speaker_label: "Me".to_string(),
+                start_ms: 0,
+                end_ms: 12_000,
+                text: "第一段 第三段".to_string(),
+                reason: "bad non-adjacent merge".to_string(),
+            }],
+        };
+
+        let sanitized = sanitize_transcript_normalization(normalization, &raw_segments);
+
+        assert_eq!(sanitized.normalized_segments.len(), 3);
+        assert!(sanitized
+            .normalized_segments
+            .iter()
+            .all(|segment| segment.operation == "keep"));
+    }
+
+    #[test]
+    fn sanitize_partial_transcript_normalization_replaces_only_candidate_segments() {
+        let raw_segments = vec![
+            transcript_segment("segment-a", "microphone", "Me", 0, 4_000, "完整一句。"),
+            transcript_segment("segment-b", "microphone", "Me", 5_000, 8_000, "这个是"),
+            transcript_segment("segment-c", "microphone", "Me", 8_200, 12_000, "后半句。"),
+            transcript_segment("segment-d", "system", "Others", 12_300, 16_000, "另一人。"),
+        ];
+        let candidate_segments = vec![&raw_segments[1], &raw_segments[2]];
+        let normalization = TranscriptNormalization {
+            normalized_segments: vec![NormalizedTranscriptSegment {
+                operation: "merge".to_string(),
+                source_segment_ids: vec!["segment-b".to_string(), "segment-c".to_string()],
+                source_kind: "microphone".to_string(),
+                speaker_label: "Me".to_string(),
+                start_ms: 5_000,
+                end_ms: 12_000,
+                text: "这个是后半句。".to_string(),
+                reason: "unfinished boundary".to_string(),
+            }],
+        };
+
+        let sanitized = sanitize_partial_transcript_normalization(
+            normalization,
+            &raw_segments,
+            &candidate_segments,
+        );
+
+        assert_eq!(sanitized.normalized_segments.len(), 3);
+        assert_eq!(sanitized.normalized_segments[0].text, "完整一句。");
+        assert_eq!(sanitized.normalized_segments[1].text, "这个是后半句。");
+        assert_eq!(
+            sanitized.normalized_segments[1].source_segment_ids,
+            vec!["segment-b", "segment-c"]
+        );
+        assert_eq!(sanitized.normalized_segments[2].text, "另一人。");
+    }
+
+    #[test]
+    fn attach_transcript_normalization_preserves_summary_fields() {
+        let normalization = TranscriptNormalization {
+            normalized_segments: vec![NormalizedTranscriptSegment {
+                operation: "split".to_string(),
+                source_segment_ids: vec!["segment-a".to_string()],
+                source_kind: "microphone".to_string(),
+                speaker_label: "Me".to_string(),
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "第一句。".to_string(),
+                reason: "source row contained multiple sentences".to_string(),
+            }],
+        };
+
+        let raw = attach_transcript_normalization(
+            r#"{"suggestedTitle":"Test","summaryOutline":[]}"#,
+            &normalization,
+        )
+        .expect("attach normalization");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse attached JSON");
+
+        assert_eq!(value["suggestedTitle"], "Test");
+        assert_eq!(
+            value["transcriptNormalization"]["normalizedSegments"][0]["operation"],
+            "split"
+        );
     }
 }

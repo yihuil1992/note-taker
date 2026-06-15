@@ -705,8 +705,6 @@ fn split_transcription_output(
 }
 
 fn split_text_part(start_ms: i64, end_ms: i64, text: &str) -> Vec<SegmentDraft> {
-    const MAX_DISPLAY_SEGMENT_MS: i64 = 8_000;
-
     let sentence_parts = split_sentences(text);
     let total_chars = sentence_parts
         .iter()
@@ -727,12 +725,11 @@ fn split_text_part(start_ms: i64, end_ms: i64, text: &str) -> Vec<SegmentDraft> 
         if sentence_end <= cursor {
             sentence_end = (cursor + 1).min(end_ms);
         }
-        drafts.extend(split_long_sentence(
-            cursor,
-            sentence_end,
-            sentence,
-            MAX_DISPLAY_SEGMENT_MS,
-        ));
+        drafts.push(SegmentDraft {
+            start_ms: cursor,
+            end_ms: sentence_end,
+            text: sentence.to_string(),
+        });
         cursor = sentence_end;
     }
 
@@ -762,58 +759,22 @@ fn split_sentences(text: &str) -> Vec<String> {
 fn push_sentence(sentences: &mut Vec<String>, current: &mut String) {
     let sentence = current.trim();
     if !sentence.is_empty() {
-        sentences.push(sentence.to_string());
+        if is_sentence_punctuation_only(sentence) {
+            if let Some(previous) = sentences.last_mut() {
+                previous.push_str(sentence);
+            } else {
+                sentences.push(sentence.to_string());
+            }
+        } else {
+            sentences.push(sentence.to_string());
+        }
     }
     current.clear();
 }
 
-fn split_long_sentence(
-    start_ms: i64,
-    end_ms: i64,
-    text: &str,
-    max_segment_ms: i64,
-) -> Vec<SegmentDraft> {
-    let duration_ms = end_ms - start_ms;
-    if duration_ms <= max_segment_ms {
-        return vec![SegmentDraft {
-            start_ms,
-            end_ms,
-            text: text.to_string(),
-        }];
-    }
-
-    let parts = ((duration_ms + max_segment_ms - 1) / max_segment_ms).max(1) as usize;
-    let chars = text.chars().collect::<Vec<_>>();
-    let chars_per_part = (chars.len() + parts - 1) / parts;
-    let mut drafts = Vec::new();
-    let mut cursor = start_ms;
-    for index in 0..parts {
-        let char_start = index * chars_per_part;
-        if char_start >= chars.len() {
-            break;
-        }
-        let char_end = ((index + 1) * chars_per_part).min(chars.len());
-        let segment_text = chars[char_start..char_end]
-            .iter()
-            .collect::<String>()
-            .trim()
-            .to_string();
-        if segment_text.is_empty() {
-            continue;
-        }
-        let segment_end = if index + 1 == parts {
-            end_ms
-        } else {
-            start_ms + ((duration_ms as i128 * (index + 1) as i128) / parts as i128) as i64
-        };
-        drafts.push(SegmentDraft {
-            start_ms: cursor,
-            end_ms: segment_end.max(cursor + 1),
-            text: segment_text,
-        });
-        cursor = segment_end;
-    }
-    drafts
+fn is_sentence_punctuation_only(text: &str) -> bool {
+    text.chars()
+        .all(|character| matches!(character, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'))
 }
 
 fn speaker_label_for_source(source_kind: &str) -> &'static str {
@@ -943,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn splits_long_unpunctuated_output_for_display() {
+    fn keeps_long_unpunctuated_output_as_one_segment() {
         let output = TranscriptionOutput {
             provider: "local-whisper".to_string(),
             transcript_text: "这是一个很长很长没有标点的测试文本用来模拟连续口语输出".to_string(),
@@ -957,15 +918,51 @@ mod tests {
 
         let segments = split_transcription_output(&test_window(), &output, "zh");
 
-        assert!(segments.len() >= 3);
-        assert!(segments
-            .iter()
-            .all(|segment| segment.end_ms - segment.start_ms <= 8_000));
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_ms, 1_000);
+        assert_eq!(segments[0].end_ms, 21_000);
         assert_eq!(
-            segments.first().map(|segment| segment.start_ms),
-            Some(1_000)
+            segments[0].text,
+            "这是一个很长很长没有标点的测试文本用来模拟连续口语输出"
         );
-        assert_eq!(segments.last().map(|segment| segment.end_ms), Some(21_000));
+    }
+
+    #[test]
+    fn keeps_comma_joined_clause_as_one_sentence_segment() {
+        let output = TranscriptionOutput {
+            provider: "openai-api:gpt-4o-transcribe".to_string(),
+            transcript_text: "是把它统一的变成是整数了，就没有那个小数点。".to_string(),
+            transcript_parts: Vec::new(),
+            output_json_path: "out.json".to_string(),
+        };
+
+        let segments = split_transcription_output(&test_window(), &output, "zh");
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].text,
+            "是把它统一的变成是整数了，就没有那个小数点。"
+        );
+    }
+
+    #[test]
+    fn keeps_repeated_sentence_punctuation_with_previous_segment() {
+        let output = TranscriptionOutput {
+            provider: "openai-api:gpt-4o-transcribe".to_string(),
+            transcript_text: "现在的department应该是跟PI有关系,但Home Department是...后面一句。"
+                .to_string(),
+            transcript_parts: Vec::new(),
+            output_json_path: "out.json".to_string(),
+        };
+
+        let segments = split_transcription_output(&test_window(), &output, "zh");
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0].text,
+            "现在的department应该是跟PI有关系,但Home Department是..."
+        );
+        assert_eq!(segments[1].text, "后面一句。");
     }
 
     #[test]
