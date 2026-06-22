@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -17,6 +17,8 @@ use thiserror::Error;
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
 const SUMMARY_PROVIDER: &str = "codex-cli";
 const SUSPICIOUS_BOUNDARY_MAX_GAP_MS: i64 = 1_500;
+const MAX_REFERENCE_FILE_BYTES: u64 = 80_000;
+const MAX_REFERENCE_SCAN_FILES: usize = 600;
 
 #[derive(Debug, Error)]
 pub enum SummaryError {
@@ -167,6 +169,127 @@ pub struct StructuredNote {
     pub open_questions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceProject {
+    pub id: String,
+    pub display_name: String,
+    pub path: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default = "default_selected")]
+    pub default_selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceMatchingMode {
+    AutoConservative,
+    AutoBroad,
+    ManualOnly,
+}
+
+impl Default for ReferenceMatchingMode {
+    fn default() -> Self {
+        Self::AutoConservative
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceContextDepth {
+    ProjectSummaries,
+    DocsAndRecentChanges,
+    DocsAndMatchingSnippets,
+}
+
+impl Default for ReferenceContextDepth {
+    fn default() -> Self {
+        Self::DocsAndMatchingSnippets
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceContextBudget {
+    Small,
+    Balanced,
+    Deep,
+}
+
+impl Default for ReferenceContextBudget {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryRunOptions {
+    pub model: Option<String>,
+    pub language: Option<String>,
+    #[serde(default)]
+    pub matching_mode: ReferenceMatchingMode,
+    #[serde(default)]
+    pub context_depth: ReferenceContextDepth,
+    #[serde(default)]
+    pub context_budget: ReferenceContextBudget,
+    #[serde(default = "default_include_git_changes")]
+    pub include_git_changes: bool,
+    #[serde(default)]
+    pub selected_project_ids: Vec<String>,
+    #[serde(default)]
+    pub reference_projects: Vec<ReferenceProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceContextMetadata {
+    pub mode: String,
+    pub depth: String,
+    pub budget: String,
+    pub included_projects: Vec<ReferenceProjectMetadata>,
+    pub skipped_projects: Vec<SkippedReferenceProjectMetadata>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferenceProjectMetadata {
+    pub id: String,
+    pub display_name: String,
+    pub match_level: String,
+    pub reasons: Vec<String>,
+    pub included_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedReferenceProjectMetadata {
+    pub id: String,
+    pub display_name: String,
+    pub reason: String,
+}
+
+struct ReferenceContextPack {
+    prompt_section: String,
+    metadata: ReferenceContextMetadata,
+}
+
+struct ReferenceSnippet {
+    relative_path: String,
+    text: String,
+    score: usize,
+}
+
+fn default_selected() -> bool {
+    true
+}
+
+fn default_include_git_changes() -> bool {
+    false
+}
+
 pub fn summarize_meeting_with_codex(
     database_path: &Path,
     work_dir: &Path,
@@ -191,10 +314,41 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
     model: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Result<MeetingSummaryResult, SummaryError> {
+    summarize_meeting_with_options(
+        database_path,
+        work_dir,
+        meeting_id,
+        None,
+        Some(model),
+        cancellation,
+    )
+}
+
+pub fn summarize_meeting_with_options(
+    database_path: &Path,
+    work_dir: &Path,
+    meeting_id: &str,
+    options: Option<SummaryRunOptions>,
+    fallback_model: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<MeetingSummaryResult, SummaryError> {
     initialize_database(database_path)?;
     fs::create_dir_all(work_dir)?;
     update_progress(cancellation, "preparing", "Loading transcript", 0, Some(6))?;
     let settings = get_app_settings(database_path)?;
+    let options =
+        options.unwrap_or_else(|| default_summary_options(&settings.reference_projects_json));
+    let model = options
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or(fallback_model)
+        .unwrap_or(settings.summary_model.as_str());
+    let summary_language = options
+        .language
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(settings.summary_language.as_str());
     let segments = list_transcript_segments_for_meeting(database_path, meeting_id)?;
     if segments.is_empty() {
         return Err(SummaryError::EmptyTranscript(meeting_id.to_string()));
@@ -235,11 +389,20 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
         Some(6),
     )?;
     let transcript = render_normalized_transcript(&normalization.normalized_segments);
+    let reference_context = build_reference_context_pack(&transcript, &options);
     let schema_path = work_dir.join("summary.schema.json");
     let output_path = work_dir.join(format!("summary-{meeting_id}.json"));
     fs::write(&schema_path, summary_schema_json())?;
 
-    let prompt = build_summary_prompt(meeting_id, &transcript, &settings.custom_glossary);
+    let prompt = build_summary_prompt(
+        meeting_id,
+        &transcript,
+        &settings.custom_glossary,
+        summary_language,
+        reference_context
+            .as_ref()
+            .map(|context| context.prompt_section.as_str()),
+    );
     if is_cancelled(cancellation) {
         update_meeting_status(database_path, meeting_id, "summary_cancelled")?;
         return Err(SummaryError::Cancelled);
@@ -267,9 +430,25 @@ pub fn summarize_meeting_with_codex_model_with_cancel(
     let raw_json = fs::read_to_string(&output_path)?;
     let summary: CodexSummary = serde_json::from_str(raw_json.trim())?;
     let raw_json = attach_transcript_normalization(raw_json.trim(), &normalization)?;
+    let raw_json = attach_reference_context(raw_json.trim(), reference_context.as_ref())?;
     let result = persist_summary(database_path, meeting_id, model, summary, &raw_json)?;
     update_progress(cancellation, "complete", "Summary complete", 6, Some(6))?;
     Ok(result)
+}
+
+fn default_summary_options(reference_projects_json: &str) -> SummaryRunOptions {
+    let reference_projects =
+        serde_json::from_str::<Vec<ReferenceProject>>(reference_projects_json).unwrap_or_default();
+    let selected_project_ids = reference_projects
+        .iter()
+        .filter(|project| project.default_selected)
+        .map(|project| project.id.clone())
+        .collect();
+    SummaryRunOptions {
+        reference_projects,
+        selected_project_ids,
+        ..SummaryRunOptions::default()
+    }
 }
 
 fn normalize_transcript_with_codex(
@@ -798,6 +977,491 @@ fn render_normalized_transcript(segments: &[NormalizedTranscriptSegment]) -> Str
         .join("\n")
 }
 
+fn build_reference_context_pack(
+    transcript: &str,
+    options: &SummaryRunOptions,
+) -> Option<ReferenceContextPack> {
+    let selected_ids = options
+        .selected_project_ids
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<HashSet<_>>();
+    let candidate_projects = options
+        .reference_projects
+        .iter()
+        .filter(|project| selected_ids.contains(project.id.as_str()))
+        .collect::<Vec<_>>();
+
+    if candidate_projects.is_empty() {
+        return None;
+    }
+
+    let total_budget_chars = context_budget_chars(&options.context_budget);
+    let per_project_chars = total_budget_chars
+        .checked_div(candidate_projects.len())
+        .unwrap_or(total_budget_chars)
+        .max(1);
+    let mut included_projects = Vec::new();
+    let mut skipped_projects = Vec::new();
+    let mut prompt_parts = Vec::new();
+    let mut truncated = false;
+
+    for project in candidate_projects {
+        let project_path = PathBuf::from(&project.path);
+        if !project_path.is_dir() {
+            skipped_projects.push(SkippedReferenceProjectMetadata {
+                id: project.id.clone(),
+                display_name: project.display_name.clone(),
+                reason: "Folder is missing or not readable".to_string(),
+            });
+            continue;
+        }
+
+        let (match_level, reasons) = score_project_match(transcript, project);
+        let terms = reference_terms(transcript, project);
+        let mut snippets =
+            collect_reference_snippets(&project_path, &terms, &options.context_depth);
+        if options.include_git_changes
+            && matches!(
+                options.context_depth,
+                ReferenceContextDepth::DocsAndRecentChanges
+                    | ReferenceContextDepth::DocsAndMatchingSnippets
+            )
+        {
+            if let Some(git_summary) = collect_git_summary(&project_path) {
+                snippets.push(git_summary);
+            }
+        }
+        if snippets.is_empty() {
+            skipped_projects.push(SkippedReferenceProjectMetadata {
+                id: project.id.clone(),
+                display_name: project.display_name.clone(),
+                reason: "No eligible reference files found".to_string(),
+            });
+            continue;
+        }
+
+        let mut remaining_project_chars = per_project_chars;
+        let mut project_text = format!(
+            "Project: {}\nFolder: {}\nRelevance hint: {} ({})\n",
+            project.display_name,
+            project.path,
+            match_level,
+            if reasons.is_empty() {
+                "selected by user; no exact lexical hit".to_string()
+            } else {
+                reasons.join("; ")
+            }
+        );
+        let mut included_files = Vec::new();
+        for snippet in snippets {
+            if remaining_project_chars == 0 {
+                truncated = true;
+                break;
+            }
+            let block = format!(
+                "\nFile: {}\n---\n{}\n---\n",
+                snippet.relative_path, snippet.text
+            );
+            let allowed = take_char_budget(&block, remaining_project_chars);
+            remaining_project_chars =
+                remaining_project_chars.saturating_sub(allowed.chars().count());
+            if allowed.len() < block.len() {
+                truncated = true;
+            }
+            project_text.push_str(&allowed);
+            included_files.push(snippet.relative_path);
+            if allowed.len() < block.len() {
+                break;
+            }
+        }
+
+        if included_files.is_empty() {
+            skipped_projects.push(SkippedReferenceProjectMetadata {
+                id: project.id.clone(),
+                display_name: project.display_name.clone(),
+                reason: "Per-project reference context budget exhausted".to_string(),
+            });
+            continue;
+        }
+
+        prompt_parts.push(project_text);
+        included_projects.push(ReferenceProjectMetadata {
+            id: project.id.clone(),
+            display_name: project.display_name.clone(),
+            match_level,
+            reasons,
+            included_files,
+        });
+    }
+
+    let metadata = ReferenceContextMetadata {
+        mode: "codex-guided".to_string(),
+        depth: context_depth_label(&options.context_depth).to_string(),
+        budget: context_budget_label(&options.context_budget).to_string(),
+        included_projects,
+        skipped_projects,
+        truncated,
+    };
+
+    let prompt_section = if prompt_parts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"
+Reference project context:
+The following local project context comes from the user-selected candidate project folders.
+The app has intentionally not excluded projects by keyword matching. You must decide which selected project context is relevant to the transcript.
+Use relevant context to disambiguate project names, modules, files, product terms, and implementation details mentioned in the transcript. Ignore irrelevant project context.
+Do not add a reference-files section, bibliography, appendix, or source list to the summary content.
+If the transcript does not support a claim, do not invent it from the reference context alone.
+
+{}
+"#,
+            prompt_parts.join("\n\n")
+        )
+    };
+
+    Some(ReferenceContextPack {
+        prompt_section,
+        metadata,
+    })
+}
+
+fn score_project_match(transcript: &str, project: &ReferenceProject) -> (String, Vec<String>) {
+    if matches!(project.id.as_str(), "") {
+        return ("none".to_string(), Vec::new());
+    }
+    let transcript_lower = transcript.to_lowercase();
+    let mut reasons = Vec::new();
+    let mut score = 0usize;
+    for term in std::iter::once(project.display_name.as_str())
+        .chain(std::iter::once(project.id.as_str()))
+        .chain(project.aliases.iter().map(String::as_str))
+    {
+        let normalized = term.trim().to_lowercase();
+        if normalized.len() < 3 {
+            continue;
+        }
+        if transcript_lower.contains(&normalized) {
+            score += if normalized.split_whitespace().count() > 1 {
+                3
+            } else {
+                2
+            };
+            reasons.push(format!("alias: {term}"));
+        }
+    }
+
+    let level = if score >= 3 {
+        "high"
+    } else if score >= 1 {
+        "medium"
+    } else {
+        "none"
+    };
+    (level.to_string(), reasons)
+}
+
+fn reference_terms(transcript: &str, project: &ReferenceProject) -> Vec<String> {
+    let mut terms = Vec::new();
+    for term in std::iter::once(project.display_name.as_str())
+        .chain(std::iter::once(project.id.as_str()))
+        .chain(project.aliases.iter().map(String::as_str))
+    {
+        let term = term.trim();
+        if term.len() >= 3 && !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_string());
+        }
+    }
+    for word in transcript
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '-' && character != '_'
+        })
+        .map(str::trim)
+        .filter(|word| word.len() >= 5)
+        .take(80)
+    {
+        if !terms
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(word))
+        {
+            terms.push(word.to_string());
+        }
+    }
+    terms
+}
+
+fn collect_reference_snippets(
+    project_path: &Path,
+    terms: &[String],
+    depth: &ReferenceContextDepth,
+) -> Vec<ReferenceSnippet> {
+    let mut files = Vec::new();
+    for relative in [
+        "README.md",
+        "PRODUCT.md",
+        "DESIGN.md",
+        "docs/SYSTEM_MAP.md",
+        "agent-docs/SYSTEM_MAP.md",
+        "AGENTS.md",
+        "AGENT.md",
+    ] {
+        push_reference_file(project_path, relative, terms, 100, &mut files);
+    }
+
+    if matches!(
+        depth,
+        ReferenceContextDepth::DocsAndRecentChanges
+            | ReferenceContextDepth::DocsAndMatchingSnippets
+    ) {
+        collect_files_from_dir(project_path, Path::new("docs"), terms, 25, &mut files);
+        collect_files_from_dir(project_path, Path::new("agent-docs"), terms, 25, &mut files);
+    }
+
+    if matches!(depth, ReferenceContextDepth::DocsAndMatchingSnippets) {
+        collect_files_from_dir(project_path, Path::new("src"), terms, 10, &mut files);
+        collect_files_from_dir(project_path, Path::new("frontend"), terms, 10, &mut files);
+        collect_files_from_dir(project_path, Path::new("backend"), terms, 10, &mut files);
+        collect_files_from_dir(project_path, Path::new("app"), terms, 10, &mut files);
+    }
+
+    files.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    files.dedup_by(|left, right| left.relative_path == right.relative_path);
+    files.truncate(10);
+    files
+}
+
+fn collect_git_summary(project_path: &Path) -> Option<ReferenceSnippet> {
+    let branch = run_git_text(project_path, &["branch", "--show-current"]).unwrap_or_default();
+    let log =
+        run_git_text(project_path, &["log", "-3", "--pretty=format:%h %cs %s"]).unwrap_or_default();
+    let status = run_git_text(project_path, &["status", "--short"]).unwrap_or_default();
+    if branch.trim().is_empty() && log.trim().is_empty() && status.trim().is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    if !branch.trim().is_empty() {
+        text.push_str("Current branch: ");
+        text.push_str(branch.trim());
+        text.push('\n');
+    }
+    if !log.trim().is_empty() {
+        text.push_str("Recent commits:\n");
+        text.push_str(log.trim());
+        text.push('\n');
+    }
+    if !status.trim().is_empty() {
+        text.push_str("Working tree status:\n");
+        text.push_str(status.trim());
+        text.push('\n');
+    }
+    Some(ReferenceSnippet {
+        relative_path: "git/recent-changes".to_string(),
+        text,
+        score: 95,
+    })
+}
+
+fn run_git_text(project_path: &Path, args: &[&str]) -> Option<String> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(project_path);
+    crate::process::suppress_console_window(&mut command);
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn collect_files_from_dir(
+    project_path: &Path,
+    relative_dir: &Path,
+    terms: &[String],
+    default_score: usize,
+    files: &mut Vec<ReferenceSnippet>,
+) {
+    let root = project_path.join(relative_dir);
+    if !root.is_dir() {
+        return;
+    }
+    let mut stack = vec![root];
+    let mut scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        if scanned >= MAX_REFERENCE_SCAN_FILES {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if scanned >= MAX_REFERENCE_SCAN_FILES {
+                break;
+            }
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if should_skip_reference_path(&file_name) {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            scanned += 1;
+            let Some(relative_path) = path
+                .strip_prefix(project_path)
+                .ok()
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+            else {
+                continue;
+            };
+            if !is_reference_text_file(&path) {
+                continue;
+            }
+            push_reference_file(project_path, &relative_path, terms, default_score, files);
+        }
+    }
+}
+
+fn push_reference_file(
+    project_path: &Path,
+    relative: &str,
+    terms: &[String],
+    base_score: usize,
+    files: &mut Vec<ReferenceSnippet>,
+) {
+    if files.iter().any(|file| file.relative_path == relative) {
+        return;
+    }
+    let path = project_path.join(relative);
+    if !path.is_file() || !is_reference_text_file(&path) {
+        return;
+    }
+    let Ok(metadata) = fs::metadata(&path) else {
+        return;
+    };
+    if metadata.len() > MAX_REFERENCE_FILE_BYTES {
+        return;
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return;
+    };
+    let score = base_score + score_text_against_terms(&raw, terms);
+    if base_score < 50 && score == base_score {
+        return;
+    }
+    files.push(ReferenceSnippet {
+        relative_path: relative.replace('\\', "/"),
+        text: truncate_for_ui(&raw, 5_000),
+        score,
+    });
+}
+
+fn score_text_against_terms(text: &str, terms: &[String]) -> usize {
+    let text = text.to_lowercase();
+    terms
+        .iter()
+        .map(|term| term.trim().to_lowercase())
+        .filter(|term| term.len() >= 3 && text.contains(term))
+        .count()
+}
+
+fn should_skip_reference_path(name: &str) -> bool {
+    let name = name.to_lowercase();
+    matches!(
+        name.as_str(),
+        ".git"
+            | "node_modules"
+            | ".next"
+            | "dist"
+            | "build"
+            | "target"
+            | "venv"
+            | ".venv"
+            | "__pycache__"
+            | "uploads"
+            | "logs"
+            | ".pytest_cache"
+    ) || name.ends_with(".log")
+        || name.ends_with(".db")
+        || name.ends_with(".sqlite")
+        || name.ends_with(".sqlite3")
+        || name.ends_with(".dump")
+        || name.ends_with(".zip")
+        || name.ends_with(".png")
+        || name.ends_with(".jpg")
+        || name.ends_with(".jpeg")
+        || name.ends_with(".gif")
+        || name.ends_with(".webp")
+        || name.ends_with(".psd")
+        || name == ".env"
+}
+
+fn is_reference_text_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(
+        extension.as_str(),
+        "md" | "txt"
+            | "html"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "py"
+            | "rs"
+            | "json"
+            | "yml"
+            | "yaml"
+            | "toml"
+            | "css"
+    )
+}
+
+fn context_budget_chars(budget: &ReferenceContextBudget) -> usize {
+    match budget {
+        ReferenceContextBudget::Small => 10_000,
+        ReferenceContextBudget::Balanced => 24_000,
+        ReferenceContextBudget::Deep => 45_000,
+    }
+}
+
+fn take_char_budget(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut output = value
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    output.push_str("...");
+    output
+}
+
+fn context_depth_label(depth: &ReferenceContextDepth) -> &'static str {
+    match depth {
+        ReferenceContextDepth::ProjectSummaries => "project-summaries",
+        ReferenceContextDepth::DocsAndRecentChanges => "docs-and-recent-changes",
+        ReferenceContextDepth::DocsAndMatchingSnippets => "docs-and-matching-snippets",
+    }
+}
+
+fn context_budget_label(budget: &ReferenceContextBudget) -> &'static str {
+    match budget {
+        ReferenceContextBudget::Small => "small",
+        ReferenceContextBudget::Balanced => "balanced",
+        ReferenceContextBudget::Deep => "deep",
+    }
+}
+
 fn compact_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -816,8 +1480,38 @@ fn attach_transcript_normalization(
     Ok(serde_json::to_string(&value)?)
 }
 
-fn build_summary_prompt(meeting_id: &str, transcript: &str, custom_glossary: &str) -> String {
+fn attach_reference_context(
+    raw_summary_json: &str,
+    reference_context: Option<&ReferenceContextPack>,
+) -> Result<String, SummaryError> {
+    let Some(reference_context) = reference_context else {
+        return Ok(raw_summary_json.to_string());
+    };
+    let mut value: serde_json::Value = serde_json::from_str(raw_summary_json)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "referenceContext".to_string(),
+            serde_json::to_value(&reference_context.metadata)?,
+        );
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn build_summary_prompt(
+    meeting_id: &str,
+    transcript: &str,
+    custom_glossary: &str,
+    summary_language: &str,
+    reference_context: Option<&str>,
+) -> String {
     let glossary_section = render_glossary_section(custom_glossary);
+    let reference_section = reference_context.unwrap_or("");
+    let language_rule = match summary_language {
+        "zh" => "The summary language should be Simplified Chinese.",
+        "ja" => "The summary language should be Japanese.",
+        "en" => "The summary language should be English.",
+        _ => "The summary language should be Simplified Chinese when the meeting is mixed-language or unclear.",
+    };
     format!(
         r#"You are summarizing a locally captured meeting transcript.
 
@@ -829,7 +1523,7 @@ Goal:
 - Do not worry that the output is long. Long meetings should produce long, structured notes.
 
 Rules:
-- The summary language should be Simplified Chinese when the meeting is mixed-language or unclear.
+- {language_rule}
 - The transcript has already passed a boundary-normalization step. Treat each line as the best available transcript segment, while still tolerating minor ASR errors.
 - The overview should be concise. summaryOutline is the comprehensive user-facing meeting record.
 - Organize summaryOutline as a hierarchy: first-level sections are major meeting themes, and each section contains concrete child points that can be expanded for detail.
@@ -842,6 +1536,8 @@ Rules:
 - Group related child items under meaningful section titles. Prefer topic-flow order over a flat chronology when it improves reviewability.
 - Put item-specific decisions, action items, and open questions inside the matching summaryOutline item. Also repeat the important storage/search rollups in the top-level decisions/actionItems/openQuestions arrays.
 - Do not create a separate "Detailed notes" section in the content. The details belong inside summaryOutline child items.
+- Do not add a reference-files section, bibliography, appendix, or source list to the summary content. Reference project context is for disambiguation only.
+- If the transcript does not support a claim, do not invent it from reference project context alone.
 - Use specific nouns from the transcript instead of generic labels. For example, if "research group report", "multi-floor map refresh", or "copyable table view" is discussed, name that artifact directly.
 - Use action item owner and dueDate only when directly inferable from the transcript.
 - Use null for unknown owner, dueDate, or evidence.
@@ -856,6 +1552,7 @@ Coverage check before returning JSON:
 
 Meeting id: {meeting_id}
 {glossary_section}
+{reference_section}
 
 Transcript:
 {transcript}
@@ -1144,11 +1841,29 @@ mod tests {
             "meeting-1",
             "[0:00-0:10] microphone / Me: We discussed RAG.",
             "RAG: retrieval augmented generation\nNote Taker: project name",
+            "auto",
+            None,
         );
 
         assert!(prompt.contains("User glossary"));
         assert!(prompt.contains("RAG: retrieval augmented generation"));
         assert!(prompt.contains("Do not invent glossary terms"));
+    }
+
+    #[test]
+    fn summary_prompt_keeps_reference_context_out_of_summary_sections() {
+        let prompt = build_summary_prompt(
+            "meeting-1",
+            "[0:00-0:10] microphone / Me: We discussed VisApp sync.",
+            "",
+            "zh",
+            Some("Reference project context:\nProject: VisApp\nFile: docs/SYSTEM_MAP.md\n---\nSync API details\n---"),
+        );
+
+        assert!(prompt.contains("The summary language should be Simplified Chinese."));
+        assert!(prompt.contains("Reference project context"));
+        assert!(prompt.contains("Do not add a reference-files section"));
+        assert!(prompt.contains("If the transcript does not support a claim"));
     }
 
     #[test]
@@ -1320,5 +2035,115 @@ mod tests {
             value["transcriptNormalization"]["normalizedSegments"][0]["operation"],
             "split"
         );
+    }
+
+    #[test]
+    fn attach_reference_context_stores_metadata_only() {
+        let metadata = ReferenceContextMetadata {
+            mode: "codex-guided".to_string(),
+            depth: "docs-and-matching-snippets".to_string(),
+            budget: "balanced".to_string(),
+            included_projects: vec![ReferenceProjectMetadata {
+                id: "vis-app".to_string(),
+                display_name: "VisApp".to_string(),
+                match_level: "high".to_string(),
+                reasons: vec!["alias: VisApp".to_string()],
+                included_files: vec!["docs/SYSTEM_MAP.md".to_string()],
+            }],
+            skipped_projects: vec![SkippedReferenceProjectMetadata {
+                id: "intranet".to_string(),
+                display_name: "Lab Operation Intranet".to_string(),
+                reason: "No strong transcript match".to_string(),
+            }],
+            truncated: false,
+        };
+        let context = ReferenceContextPack {
+            prompt_section: "secret snippet that should not be stored".to_string(),
+            metadata,
+        };
+        let raw = attach_reference_context(
+            r#"{"suggestedTitle":"Test","summaryOutline":[]}"#,
+            Some(&context),
+        )
+        .expect("attach reference context");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("parse attached JSON");
+
+        assert_eq!(
+            value["referenceContext"]["includedProjects"][0]["id"],
+            "vis-app"
+        );
+        assert_eq!(
+            value["referenceContext"]["skippedProjects"][0]["id"],
+            "intranet"
+        );
+        assert!(!raw.contains("secret snippet"));
+    }
+
+    #[test]
+    fn reference_context_uses_fair_budget_for_selected_projects() {
+        let root = std::env::temp_dir().join(format!(
+            "note-taker-reference-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let access_dir = root.join("access-request-app");
+        let vis_dir = root.join("vis-app");
+        fs::create_dir_all(&access_dir).expect("create access dir");
+        fs::create_dir_all(&vis_dir).expect("create vis dir");
+        fs::write(
+            access_dir.join("README.md"),
+            format!(
+                "# Access app\n\n{}",
+                "access workflow grant revoke ".repeat(900)
+            ),
+        )
+        .expect("write access readme");
+        fs::write(
+            vis_dir.join("README.md"),
+            "# Vis App\n\nResearch group, department, people import, and PI binding UI.\n",
+        )
+        .expect("write vis readme");
+
+        let options = SummaryRunOptions {
+            context_budget: ReferenceContextBudget::Small,
+            context_depth: ReferenceContextDepth::ProjectSummaries,
+            include_git_changes: false,
+            selected_project_ids: vec!["access".to_string(), "vis".to_string()],
+            reference_projects: vec![
+                ReferenceProject {
+                    id: "access".to_string(),
+                    display_name: "access app".to_string(),
+                    path: access_dir.display().to_string(),
+                    aliases: vec![],
+                    default_selected: true,
+                },
+                ReferenceProject {
+                    id: "vis".to_string(),
+                    display_name: "vis app".to_string(),
+                    path: vis_dir.display().to_string(),
+                    aliases: vec!["research group".to_string(), "department".to_string()],
+                    default_selected: true,
+                },
+            ],
+            ..SummaryRunOptions::default()
+        };
+
+        let context = build_reference_context_pack(
+            "Most of this meeting is about the vis app research group and department flows.",
+            &options,
+        )
+        .expect("reference context");
+        let included_ids = context
+            .metadata
+            .included_projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(included_ids.contains(&"access"));
+        assert!(included_ids.contains(&"vis"));
+        assert!(context.prompt_section.contains("Vis App"));
+        assert_eq!(context.metadata.mode, "codex-guided");
+
+        let _ = fs::remove_dir_all(root);
     }
 }
