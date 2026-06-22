@@ -28,9 +28,11 @@ import {
   Sparkles,
   Square,
   Sun,
-  Trash2
+  Trash2,
+  X
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow, LogicalSize, type PhysicalSize } from "@tauri-apps/api/window";
 import appIconUrl from "./assets/app-icon.png";
 import "./styles.css";
@@ -67,8 +69,46 @@ type AppSettings = {
   openaiTranscriptionModel: string;
   languageHint: string;
   summaryLanguage: string;
+  referenceProjectsJson: string;
   customGlossary: string;
   recordingConsentReminderDismissed: boolean;
+};
+
+type ReferenceProject = {
+  id: string;
+  displayName: string;
+  path: string;
+  aliases: string[];
+  defaultSelected: boolean;
+};
+
+type SummaryRunOptions = {
+  model: string;
+  language: string;
+  contextDepth: "project-summaries" | "docs-and-recent-changes" | "docs-and-matching-snippets";
+  contextBudget: "small" | "balanced" | "deep";
+  includeGitChanges: boolean;
+  selectedProjectIds: string[];
+  referenceProjects: ReferenceProject[];
+};
+
+type ReferenceContextMetadata = {
+  mode?: string;
+  depth?: string;
+  budget?: string;
+  includedProjects?: Array<{
+    id: string;
+    displayName: string;
+    matchLevel: string;
+    reasons: string[];
+    includedFiles: string[];
+  }>;
+  skippedProjects?: Array<{
+    id: string;
+    displayName: string;
+    reason: string;
+  }>;
+  truncated?: boolean;
 };
 
 type GlossaryEntry = {
@@ -351,6 +391,7 @@ const defaultSettings: AppSettings = {
   openaiTranscriptionModel: "gpt-4o-mini-transcribe",
   languageHint: "zh",
   summaryLanguage: "auto",
+  referenceProjectsJson: "[]",
   customGlossary: "",
   recordingConsentReminderDismissed: false
 };
@@ -396,6 +437,16 @@ const SUMMARY_LANGUAGE_OPTIONS: AtlasSelectOption[] = [
   { value: "ja", label: "Japanese" },
   { value: "en", label: "English" }
 ];
+const REFERENCE_DEPTH_OPTIONS: AtlasSelectOption[] = [
+  { value: "project-summaries", label: "Project summaries only" },
+  { value: "docs-and-recent-changes", label: "Docs + recent changes" },
+  { value: "docs-and-matching-snippets", label: "Docs + matching snippets" }
+];
+const REFERENCE_BUDGET_OPTIONS: AtlasSelectOption[] = [
+  { value: "small", label: "Small" },
+  { value: "balanced", label: "Balanced" },
+  { value: "deep", label: "Deep" }
+];
 const CHUNK_SECONDS_OPTIONS: AtlasSelectOption[] = [
   { value: "10", label: "Auto smart chunks, recommended" },
   { value: "5", label: "5 seconds" },
@@ -432,6 +483,8 @@ function App() {
   const [updateProgress, setUpdateProgress] = React.useState<AppUpdateProgress | null>(null);
   const [glossaryEntries, setGlossaryEntries] = React.useState<GlossaryEntry[]>(() => parseGlossaryEntries(defaultSettings.customGlossary));
   const [expandedGlossaryEntryId, setExpandedGlossaryEntryId] = React.useState<string | null>(null);
+  const [referenceProjectDrafts, setReferenceProjectDrafts] = React.useState<ReferenceProject[]>(() => parseReferenceProjects(defaultSettings.referenceProjectsJson));
+  const [summaryDialogOptions, setSummaryDialogOptions] = React.useState<SummaryRunOptions | null>(null);
   const [openaiApiKeyStatus, setOpenaiApiKeyStatus] = React.useState<OpenAiApiKeyStatus | null>(null);
   const [openaiApiKeyDraft, setOpenaiApiKeyDraft] = React.useState("");
   const [miniMode, setMiniMode] = React.useState(false);
@@ -485,6 +538,10 @@ function App() {
     setGlossaryEntries(parseGlossaryEntries(settings.customGlossary));
     setExpandedGlossaryEntryId(null);
   }, [settings.customGlossary]);
+
+  React.useEffect(() => {
+    setReferenceProjectDrafts(parseReferenceProjects(settings.referenceProjectsJson));
+  }, [settings.referenceProjectsJson]);
 
   async function refreshAll(activeMeetingId = selectedMeetingId) {
     setError(null);
@@ -654,13 +711,29 @@ function App() {
     }
   }
 
-  async function summarizeSelected() {
+  function openSummaryDialog() {
     if (!selectedMeetingId) return;
+    const projects = normalizeReferenceProjects(referenceProjectDrafts);
+    setSummaryDialogOptions({
+      model: settings.summaryModel,
+      language: settings.summaryLanguage,
+      contextDepth: "docs-and-matching-snippets",
+      contextBudget: "balanced",
+      includeGitChanges: false,
+      selectedProjectIds: projects.filter((project) => project.defaultSelected).map((project) => project.id),
+      referenceProjects: projects
+    });
+  }
+
+  async function summarizeSelected(options: SummaryRunOptions) {
+    if (!selectedMeetingId) return;
+    setSummaryDialogOptions(null);
     setBusy("summarizing");
     setError(null);
     try {
       const result = await callBackend<MeetingSummaryResult>("summarize_meeting_demo", {
-        meetingId: selectedMeetingId
+        meetingId: selectedMeetingId,
+        options
       });
       setNotice(`Generated summary: ${result.suggestedTitle}`);
       void notifyTaskComplete("Summary complete", result.suggestedTitle);
@@ -677,6 +750,66 @@ function App() {
     }
   }
 
+  function updateReferenceProjectDraft(id: string, patch: Partial<ReferenceProject>) {
+    setReferenceProjectDrafts((projects) => projects.map((project) => project.id === id ? { ...project, ...patch } : project));
+  }
+
+  async function pickReferenceProjectFolder(): Promise<string | null> {
+    if (!window.__TAURI_INTERNALS__) {
+      return window.prompt("Reference project folder path")?.trim() || null;
+    }
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Select reference project folder"
+    });
+    if (typeof selected === "string") return selected;
+    if (Array.isArray(selected)) return selected[0] ?? null;
+    return null;
+  }
+
+  async function addReferenceProjectDraft() {
+    const selectedPath = await pickReferenceProjectFolder();
+    if (!selectedPath) return;
+    const nextId = `project-${Date.now()}`;
+    setReferenceProjectDrafts((projects) => [
+      ...projects,
+      {
+        id: nextId,
+        displayName: folderNameFromPath(selectedPath) || "New reference project",
+        path: selectedPath,
+        aliases: [],
+        defaultSelected: true
+      }
+    ]);
+  }
+
+  async function chooseReferenceProjectFolder(id: string) {
+    setError(null);
+    try {
+      const selectedPath = await pickReferenceProjectFolder();
+      if (selectedPath) {
+        updateReferenceProjectDraft(id, { path: selectedPath });
+      }
+    } catch (folderError) {
+      setError(String(folderError));
+    }
+  }
+
+  function removeReferenceProjectDraft(id: string) {
+    setReferenceProjectDrafts((projects) => projects.filter((project) => project.id !== id));
+  }
+
+  async function saveReferenceProjects() {
+    const normalized = normalizeReferenceProjects(referenceProjectDrafts);
+    if (normalized.some((project) => !project.path.trim())) {
+      setError("Reference project paths cannot be empty.");
+      return;
+    }
+    await updateSetting("reference_projects_json", JSON.stringify(normalized));
+    setNotice("Reference projects saved.");
+  }
+
   async function cancelSelectedTask(meetingId = selectedMeetingId) {
     if (!meetingId) return;
     setBusy("canceling");
@@ -684,6 +817,17 @@ function App() {
     try {
       const result = await callBackend<CancelMeetingTaskResult>("cancel_meeting_task", { meetingId });
       setNotice(result.cancelRequested ? "Stop requested. Current task is winding down." : "No active worker was found. The meeting was marked stopped.");
+      if (!isTaskActiveStatus(result.status)) {
+        setTaskStatuses((statuses) => {
+          const next = { ...statuses };
+          delete next[meetingId];
+          return next;
+        });
+        setMeetings((items) => items.map((meeting) => meeting.id === meetingId ? { ...meeting, status: result.status } : meeting));
+        setDetail((current) => current?.meeting.id === meetingId
+          ? { ...current, meeting: { ...current.meeting, status: result.status } }
+          : current);
+      }
       await refreshAll(meetingId);
     } catch (cancelError) {
       setError(String(cancelError));
@@ -1155,7 +1299,7 @@ function App() {
               exportResult={exportResult}
               onTranscribe={() => void transcribeSelected()}
               onRetranscribe={() => void retranscribeSelected()}
-              onSummarize={() => void summarizeSelected()}
+              onSummarize={openSummaryDialog}
               onCancelTask={() => void cancelSelectedTask()}
               onArchive={() => void archiveSelected()}
               onExportMarkdown={() => void exportSelected("markdown")}
@@ -1168,6 +1312,16 @@ function App() {
             </section>
           )}
         </section>
+
+        {summaryDialogOptions && detail ? (
+          <SummaryOptionsDialog
+            options={summaryDialogOptions}
+            hasExistingSummary={Boolean(detail.summary)}
+            onChange={(options) => setSummaryDialogOptions(options)}
+            onClose={() => setSummaryDialogOptions(null)}
+            onConfirm={(options) => void summarizeSelected(options)}
+          />
+        ) : null}
 
         <aside id="settings" className="atlas-instruments">
           <section className="panel local-ai-panel">
@@ -1189,6 +1343,82 @@ function App() {
             <button className="secondary-action sidecar-folder-action" type="button" onClick={() => void callBackend<void>("open_sidecar_folder")} aria-label="Open sidecar folder">
               <FolderOpen size={16} aria-hidden="true" />
               Open folder
+            </button>
+          </section>
+
+          <section className="panel reference-projects-panel">
+            <div className="panel-title-row">
+              <div>
+                <p className="section-label">Reference</p>
+                <h3>Projects</h3>
+                <small>{referenceProjectDrafts.length === 0 ? "No folders configured" : `${referenceProjectDrafts.length} candidate folders`}</small>
+              </div>
+              <button className="ghost-action" type="button" onClick={() => void addReferenceProjectDraft()}>
+                <Plus size={14} aria-hidden="true" />
+                Add
+              </button>
+            </div>
+            <div className="reference-project-list">
+              {referenceProjectDrafts.length === 0 ? (
+                <div className="glossary-empty">
+                  <strong>Add local folders for project-aware summaries.</strong>
+                  <span>They are only read when selected before a summary run.</span>
+                </div>
+              ) : referenceProjectDrafts.map((project) => (
+                <article className="reference-project-card" key={project.id}>
+                  <div className="reference-project-card-head">
+                    <label className="toggle-line">
+                      <input
+                        type="checkbox"
+                        checked={project.defaultSelected}
+                        onChange={(event) => updateReferenceProjectDraft(project.id, { defaultSelected: event.target.checked })}
+                      />
+                      <span>Selected by default</span>
+                    </label>
+                    <button
+                      className="icon-action"
+                      type="button"
+                      onClick={() => removeReferenceProjectDraft(project.id)}
+                      aria-label="Remove reference project"
+                      title="Remove reference project"
+                    >
+                      <Trash2 size={15} aria-hidden="true" />
+                    </button>
+                  </div>
+                  <label className="field compact-field">
+                    <span>Name</span>
+                    <input value={project.displayName} onChange={(event) => updateReferenceProjectDraft(project.id, { displayName: event.target.value })} />
+                  </label>
+                  <div className="field compact-field">
+                    <span>Folder path</span>
+                    <div className="path-input-row">
+                      <input value={project.path} onChange={(event) => updateReferenceProjectDraft(project.id, { path: event.target.value })} />
+                      <button
+                        className="secondary-action icon-only tooltip-action"
+                        type="button"
+                        onClick={() => void chooseReferenceProjectFolder(project.id)}
+                        aria-label="Choose reference project folder"
+                        data-tooltip="Choose folder"
+                        title="Choose folder"
+                      >
+                        <FolderOpen size={15} aria-hidden="true" />
+                      </button>
+                    </div>
+                  </div>
+                  <label className="field compact-field">
+                    <span>Aliases</span>
+                    <input
+                      value={project.aliases.join(", ")}
+                      onChange={(event) => updateReferenceProjectDraft(project.id, { aliases: splitAliases(event.target.value) })}
+                      placeholder="intranet, operational issue, VisApp sync"
+                    />
+                  </label>
+                </article>
+              ))}
+            </div>
+            <button className="secondary-action full-width" type="button" onClick={() => void saveReferenceProjects()}>
+              <CheckCircle2 size={16} aria-hidden="true" />
+              Save reference projects
             </button>
           </section>
 
@@ -1670,6 +1900,7 @@ function MeetingDetailView({
   const summary = detail.summary;
   const actionItems = parseActionItems(summary?.actionItemsJson);
   const summaryOutline = parseSummaryOutline(summary?.rawJson);
+  const referenceContext = parseReferenceContext(summary?.rawJson);
   const duration = detail.meeting.endedAt
     ? `${Math.max(1, Math.round((new Date(detail.meeting.endedAt).getTime() - new Date(detail.meeting.startedAt).getTime()) / 60000))}m`
     : "In progress";
@@ -1697,7 +1928,7 @@ function MeetingDetailView({
           </button>
           <button className="secondary-action" type="button" onClick={onSummarize} disabled={taskActive || detail.transcriptSegments.length === 0}>
             <Sparkles size={16} aria-hidden="true" />
-            {busy === "summarizing" ? "Summarizing..." : "Summarize"}
+            {busy === "summarizing" ? "Summarizing..." : summary ? "Re-summarize" : "Summarize"}
           </button>
         </div>
       </div>
@@ -1720,6 +1951,7 @@ function MeetingDetailView({
             </div>
             {summary ? <span className="provider-pill">Generated by {summary.provider}</span> : null}
           </div>
+          {referenceContext ? <GenerationDetails context={referenceContext} /> : null}
           <div className="summary-scroll">
             {summary ? (
               <>
@@ -1806,6 +2038,148 @@ function MeetingDetailView({
         )}
       </section>
     </section>
+  );
+}
+
+function SummaryOptionsDialog({
+  options,
+  hasExistingSummary,
+  onChange,
+  onClose,
+  onConfirm
+}: {
+  options: SummaryRunOptions;
+  hasExistingSummary: boolean;
+  onChange: (options: SummaryRunOptions) => void;
+  onClose: () => void;
+  onConfirm: (options: SummaryRunOptions) => void;
+}) {
+  const selectedCount = options.selectedProjectIds.length;
+  const update = (patch: Partial<SummaryRunOptions>) => onChange({ ...options, ...patch });
+  const toggleProject = (projectId: string, checked: boolean) => {
+    const nextIds = checked
+      ? Array.from(new Set([...options.selectedProjectIds, projectId]))
+      : options.selectedProjectIds.filter((id) => id !== projectId);
+    update({ selectedProjectIds: nextIds });
+  };
+
+  return createPortal(
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section className="summary-options-modal" role="dialog" aria-modal="true" aria-labelledby="summary-options-title">
+        <div className="panel-title-row">
+          <div>
+            <p className="section-label">Summarize</p>
+            <h3 id="summary-options-title">{hasExistingSummary ? "Re-summarize meeting" : "Generate summary"}</h3>
+            <small>{selectedCount === 0 ? "No reference projects selected" : `${selectedCount} candidate reference projects selected`}</small>
+          </div>
+          <button className="icon-action" type="button" onClick={onClose} aria-label="Close summary options">
+            <X size={15} aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="summary-options-grid">
+          <label className="field">
+            <span>Codex model</span>
+            <AtlasSelect value={options.model} options={SUMMARY_MODEL_OPTIONS} onChange={(value) => update({ model: value })} />
+          </label>
+          <label className="field">
+            <span>Summary language</span>
+            <AtlasSelect value={options.language} options={SUMMARY_LANGUAGE_OPTIONS} onChange={(value) => update({ language: value })} />
+          </label>
+          <label className="field">
+            <span>Context depth</span>
+            <AtlasSelect value={options.contextDepth} options={REFERENCE_DEPTH_OPTIONS} onChange={(value) => update({ contextDepth: value as SummaryRunOptions["contextDepth"] })} />
+          </label>
+          <label className="field">
+            <span>Context budget</span>
+            <AtlasSelect value={options.contextBudget} options={REFERENCE_BUDGET_OPTIONS} onChange={(value) => update({ contextBudget: value as SummaryRunOptions["contextBudget"] })} />
+          </label>
+          <label className="toggle-line summary-toggle-line">
+            <input
+              type="checkbox"
+              checked={options.includeGitChanges}
+              onChange={(event) => update({ includeGitChanges: event.target.checked })}
+            />
+            <span>Include recent git changes</span>
+          </label>
+        </div>
+
+        <div className="summary-project-picker">
+          <div className="summary-project-picker-head">
+            <strong>Candidate projects</strong>
+            <small>Codex will decide which selected project context is relevant to the transcript.</small>
+          </div>
+          {options.referenceProjects.length === 0 ? (
+            <div className="glossary-empty">
+              <strong>No reference projects configured.</strong>
+              <span>The summary will use only transcript and glossary context.</span>
+            </div>
+          ) : (
+            options.referenceProjects.map((project) => (
+              <label className="summary-project-option" key={project.id}>
+                <input
+                  type="checkbox"
+                  checked={options.selectedProjectIds.includes(project.id)}
+                  onChange={(event) => toggleProject(project.id, event.target.checked)}
+                />
+                <span>
+                  <strong>{project.displayName}</strong>
+                  <small>{project.path}</small>
+                </span>
+              </label>
+            ))
+          )}
+        </div>
+
+        <div className="summary-options-actions">
+          <button className="secondary-action" type="button" onClick={onClose}>Cancel</button>
+          <button className="primary-action" type="button" onClick={() => onConfirm(options)}>
+            <Sparkles size={16} aria-hidden="true" />
+            {hasExistingSummary ? "Re-summarize" : "Generate summary"}
+          </button>
+        </div>
+      </section>
+    </div>,
+    document.body
+  );
+}
+
+function GenerationDetails({ context }: { context: ReferenceContextMetadata }) {
+  const included = context.includedProjects ?? [];
+  const skipped = context.skippedProjects ?? [];
+  return (
+    <details className="generation-details">
+      <summary>
+        <span>Generation details</span>
+        <small>{included.length === 0 ? "No reference context used" : `${included.length} project${included.length === 1 ? "" : "s"} used`}</small>
+      </summary>
+      <div className="generation-details-body">
+        <p>
+          Mode: {context.mode ?? "unknown"} · Depth: {context.depth ?? "unknown"} · Budget: {context.budget ?? "unknown"}
+          {context.truncated ? " · Truncated" : ""}
+        </p>
+        {included.length > 0 ? (
+          <div className="generation-project-group">
+            <strong>Used</strong>
+            {included.map((project) => (
+              <span key={project.id}>
+                {project.displayName} ({project.matchLevel}) · {project.includedFiles.join(", ")}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {skipped.length > 0 ? (
+          <div className="generation-project-group">
+            <strong>Skipped</strong>
+            {skipped.map((project) => (
+              <span key={project.id}>{project.displayName}: {project.reason}</span>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -2128,6 +2502,17 @@ function parseDetailedNotes(raw?: string | null): DetailedSummaryNote[] {
   }
 }
 
+function parseReferenceContext(raw?: string | null): ReferenceContextMetadata | null {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw);
+    if (!value?.referenceContext || typeof value.referenceContext !== "object") return null;
+    return value.referenceContext as ReferenceContextMetadata;
+  } catch {
+    return null;
+  }
+}
+
 function parseStructuredNotes(raw?: string | null): StructuredSummaryNote[] {
   if (!raw) return [];
   try {
@@ -2175,6 +2560,55 @@ function normalizeStructuredNote(item: unknown): StructuredSummaryNote | null {
 
 function parseStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : [];
+}
+
+function parseReferenceProjects(rawJson?: string | null): ReferenceProject[] {
+  if (!rawJson) return [];
+  try {
+    return normalizeReferenceProjects(JSON.parse(rawJson));
+  } catch {
+    return [];
+  }
+}
+
+function normalizeReferenceProjects(value: unknown): ReferenceProject[] {
+  if (!Array.isArray(value)) return [];
+  const usedIds = new Set<string>();
+  return value
+    .map((item, index) => {
+      const record = item as Partial<ReferenceProject>;
+      const displayName = String(record.displayName ?? "").trim() || `Reference project ${index + 1}`;
+      const rawId = String(record.id ?? displayName)
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || `project-${index + 1}`;
+      let id = rawId;
+      let suffix = 2;
+      while (usedIds.has(id)) {
+        id = `${rawId}-${suffix}`;
+        suffix += 1;
+      }
+      usedIds.add(id);
+      return {
+        id,
+        displayName,
+        path: String(record.path ?? "").trim(),
+        aliases: Array.isArray(record.aliases)
+          ? record.aliases.map(String).map((alias) => alias.trim()).filter(Boolean)
+          : [],
+        defaultSelected: record.defaultSelected !== false
+      };
+    })
+    .filter((project) => project.displayName.trim() || project.path.trim());
+}
+
+function splitAliases(value: string): string[] {
+  return value.split(",").map((alias) => alias.trim()).filter(Boolean);
+}
+
+function folderNameFromPath(path: string): string {
+  return path.split(/[\\/]+/).filter(Boolean).pop()?.trim() ?? "";
 }
 
 function formatSectionTitle(value: string): string {
@@ -2397,6 +2831,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       ...(key === "openai_transcription_model" ? { openaiTranscriptionModel: value } : {}),
       ...(key === "language_hint" ? { languageHint: value } : {}),
       ...(key === "summary_language" ? { summaryLanguage: value } : {}),
+      ...(key === "reference_projects_json" ? { referenceProjectsJson: value } : {}),
       ...(key === "custom_glossary" ? { customGlossary: value } : {}),
       ...(key === "recording_consent_reminder_dismissed" ? { recordingConsentReminderDismissed: value === "true" } : {})
     };
@@ -2527,6 +2962,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "summarize_meeting_demo") {
     const id = String(args?.meetingId ?? "");
+    const options = args?.options as SummaryRunOptions | undefined;
     mockTaskStatuses[id] = {
       meetingId: id,
       kind: "summary",
@@ -2538,7 +2974,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       cancelRequested: false
     };
     const detail = mockDetails[id];
-    detail.summary = makeSummary(id);
+    detail.summary = makeSummary(id, options);
     detail.meeting.title = detail.summary.suggestedTitle;
     detail.meeting.status = "summarized";
     mockMeetings = mockMeetings.map((meeting) => meeting.id === id ? toListItem(detail) : meeting);
@@ -2745,7 +3181,8 @@ function makeSegments(id: string): TranscriptSegmentRecord[] {
   ];
 }
 
-function makeSummary(id: string): MeetingSummaryRecord {
+function makeSummary(id: string, options?: SummaryRunOptions): MeetingSummaryRecord {
+  const selectedProjects = options?.referenceProjects.filter((project) => options.selectedProjectIds.includes(project.id)) ?? [];
   const rawSummary = {
     suggestedTitle: "Local transcription smoke review",
     language: "zh-CN",
@@ -2809,7 +3246,25 @@ function makeSummary(id: string): MeetingSummaryRecord {
           }
         ]
       }
-    ]
+    ],
+    referenceContext: options ? {
+      mode: "codex-guided",
+      depth: options.contextDepth,
+      budget: options.contextBudget,
+      includedProjects: selectedProjects.slice(0, 2).map((project) => ({
+        id: project.id,
+        displayName: project.displayName,
+        matchLevel: "selected",
+        reasons: ["mock preview"],
+        includedFiles: ["README.md", "docs/SYSTEM_MAP.md"]
+      })),
+      skippedProjects: selectedProjects.slice(2).map((project) => ({
+        id: project.id,
+        displayName: project.displayName,
+        reason: "No strong transcript match"
+      })),
+      truncated: false
+    } : undefined
   };
   return {
     meetingId: id,

@@ -39,7 +39,9 @@ use storage::{
     list_recent_meetings, search_meetings as search_meeting_records, set_app_setting,
     update_meeting_status, AppSettingsRecord, MeetingDetailRecord, MeetingListItem,
 };
-use summary::{summarize_meeting_with_codex_model_with_cancel, MeetingSummaryResult};
+use summary::{
+    summarize_meeting_with_options, MeetingSummaryResult, ReferenceProject, SummaryRunOptions,
+};
 use task_control::{CancelMeetingTaskResult, MeetingTaskStatus, TaskCancellationRegistry};
 use tauri::Manager;
 use updates::{check_latest_release, AppUpdateCheck};
@@ -241,24 +243,24 @@ async fn summarize_meeting_demo(
     app: tauri::AppHandle,
     task_registry: tauri::State<'_, TaskCancellationRegistry>,
     meeting_id: String,
+    options: Option<SummaryRunOptions>,
 ) -> Result<MeetingSummaryResult, String> {
     let paths = AppPaths::resolve(&app)?;
     paths.ensure()?;
     initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
-    let settings = load_app_settings(&paths.database_path).map_err(|error| error.to_string())?;
     let database_path = paths.database_path;
     let summaries_dir = paths.summaries_dir;
-    let summary_model = settings.summary_model;
     let token = task_registry
         .begin(&meeting_id, "summary")
         .map_err(|error| error.to_string())?;
     let worker_meeting_id = meeting_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        summarize_meeting_with_codex_model_with_cancel(
+        summarize_meeting_with_options(
             &database_path,
             &summaries_dir,
             &worker_meeting_id,
-            &summary_model,
+            options,
+            None,
             Some(&token),
         )
     })
@@ -285,13 +287,7 @@ fn cancel_meeting_task(
         .map_err(|error| error.to_string())?
         .map(|meeting| meeting.status)
         .unwrap_or_else(|| "unknown".to_string());
-    let next_status = match status.as_str() {
-        "transcribing" | "canceling" if cancel_requested => "canceling",
-        "summarizing" if cancel_requested => "canceling",
-        "transcribing" => "transcription_cancelled",
-        "summarizing" => "summary_cancelled",
-        other => other,
-    };
+    let next_status = cancel_status_transition(&status, cancel_requested);
     if next_status != status {
         update_meeting_status(&paths.database_path, &meeting_id, next_status)
             .map_err(|error| error.to_string())?;
@@ -302,6 +298,17 @@ fn cancel_meeting_task(
         cancel_requested,
         status: next_status.to_string(),
     })
+}
+
+fn cancel_status_transition(status: &str, cancel_requested: bool) -> &str {
+    match status {
+        "transcribing" | "canceling" if cancel_requested => "canceling",
+        "summarizing" if cancel_requested => "canceling",
+        "transcribing" => "transcription_cancelled",
+        "summarizing" => "summary_cancelled",
+        "canceling" => "summary_cancelled",
+        other => other,
+    }
 }
 
 #[tauri::command]
@@ -571,6 +578,7 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         ),
         "language_hint" => matches!(value, "auto" | "zh" | "ja" | "en"),
         "summary_language" => matches!(value, "auto" | "zh" | "ja" | "en"),
+        "reference_projects_json" => validate_reference_projects_json(value),
         "custom_glossary" => value.len() <= 12_000 && !value.contains('\0'),
         "recording_consent_reminder_dismissed" => matches!(value, "true" | "false"),
         _ => false,
@@ -580,6 +588,28 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
     } else {
         Err(format!("Unsupported setting {key}={value}"))
     }
+}
+
+fn validate_reference_projects_json(value: &str) -> bool {
+    if value.len() > 20_000 || value.contains('\0') {
+        return false;
+    }
+    let Ok(projects) = serde_json::from_str::<Vec<ReferenceProject>>(value) else {
+        return false;
+    };
+    projects.iter().all(|project| {
+        !project.id.trim().is_empty()
+            && !project.display_name.trim().is_empty()
+            && !project.path.trim().is_empty()
+            && project.id.len() <= 120
+            && project.display_name.len() <= 160
+            && project.path.len() <= 1000
+            && project.aliases.len() <= 50
+            && project
+                .aliases
+                .iter()
+                .all(|alias| alias.len() <= 160 && !alias.contains('\0'))
+    })
 }
 
 fn display_path(path: &PathBuf) -> String {
@@ -655,6 +685,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(RecordingManager::default())
         .manage(TaskCancellationRegistry::default())
@@ -694,4 +725,23 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Note Taker");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cancel_status_transition;
+
+    #[test]
+    fn cancel_without_worker_clears_orphan_canceling_status() {
+        assert_eq!(
+            cancel_status_transition("canceling", false),
+            "summary_cancelled"
+        );
+    }
+
+    #[test]
+    fn cancel_with_worker_keeps_canceling_status() {
+        assert_eq!(cancel_status_transition("summarizing", true), "canceling");
+        assert_eq!(cancel_status_transition("transcribing", true), "canceling");
+    }
 }

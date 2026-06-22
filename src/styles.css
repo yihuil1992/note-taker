@@ -1320,6 +1320,196 @@ code {
   background: rgba(2, 4, 10, 0.42);
 }
 
+.compact-field input,
+.summary-project-option input,
+.toggle-line input {
+  accent-color: var(--accent);
+}
+
+.compact-field input {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+  font-weight: 560;
+}
+
+.compact-field input::placeholder {
+  color: var(--muted);
+}
+
+.reference-projects-panel {
+  gap: 12px;
+}
+
+.reference-projects-panel .panel-title-row small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.reference-project-list {
+  display: grid;
+  gap: 9px;
+}
+
+.reference-project-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.path-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+  align-items: center;
+}
+
+.path-input-row .secondary-action.icon-only {
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+}
+
+.reference-project-card-head,
+.toggle-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.reference-project-card-head {
+  justify-content: space-between;
+}
+
+.toggle-line {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.toggle-line input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.summary-options-modal {
+  display: grid;
+  gap: 15px;
+  width: min(760px, 100%);
+  max-height: min(820px, calc(100vh - 40px));
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--surface-solid);
+}
+
+.summary-options-modal .panel-title-row small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.summary-options-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.summary-toggle-line {
+  align-self: end;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.summary-project-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.summary-project-picker-head {
+  display: grid;
+  gap: 3px;
+}
+
+.summary-project-picker-head strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.summary-project-picker-head small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.summary-project-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.summary-project-option input {
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+}
+
+.summary-project-option span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.summary-project-option strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.summary-project-option small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.summary-options-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .secret-input-wrap svg {
   flex: 0 0 auto;
   color: var(--muted);
@@ -1667,7 +1857,7 @@ code {
 
 .atlas-select-menu {
   position: fixed;
-  z-index: 30;
+  z-index: 120;
   display: grid;
   gap: 2px;
   max-height: min(260px, 42vh);
@@ -1888,6 +2078,65 @@ code {
   color: var(--ink-soft);
   font-size: 14px;
   line-height: 1.58;
+}
+
+.generation-details {
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-soft);
+}
+
+.generation-details summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 10px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 720;
+  list-style: none;
+}
+
+.generation-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.generation-details summary small {
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.generation-details-body {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.generation-details-body p {
+  margin: 0;
+}
+
+.generation-project-group {
+  display: grid;
+  gap: 4px;
+}
+
+.generation-project-group strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.generation-project-group span {
+  color: var(--ink-soft);
 }
 
 .summary-section {
@@ -2598,16 +2847,28 @@ code {
   background: rgba(255, 255, 252, 0.76);
 }
 
+:root[data-atlas-mode="archive"] .modal-backdrop {
+  background: rgba(23, 32, 51, 0.34);
+}
+
+:root[data-atlas-mode="archive"] .summary-options-modal {
+  background: rgba(255, 255, 252, 0.98);
+}
+
 :root[data-atlas-mode="archive"] .atlas-shell .atlas-select-trigger,
+:root[data-atlas-mode="archive"] .summary-options-modal .atlas-select-trigger,
 :root[data-atlas-mode="archive"] .atlas-shell .search-box,
 :root[data-atlas-mode="archive"] .atlas-shell .icon-button,
 :root[data-atlas-mode="archive"] .atlas-shell .secondary-action,
+:root[data-atlas-mode="archive"] .summary-options-modal .secondary-action,
 :root[data-atlas-mode="archive"] .theme-toggle {
   background: rgba(255, 255, 252, 0.76);
 }
 
 :root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap,
-:root[data-atlas-mode="archive"] .atlas-shell .icon-action {
+:root[data-atlas-mode="archive"] .atlas-shell .compact-field input,
+:root[data-atlas-mode="archive"] .atlas-shell .icon-action,
+:root[data-atlas-mode="archive"] .summary-options-modal .icon-action {
   border-color: rgba(71, 124, 134, 0.24);
   color: var(--ink-soft);
   background: rgba(255, 255, 252, 0.82);
@@ -2625,6 +2886,10 @@ code {
   color: #596675;
 }
 
+:root[data-atlas-mode="archive"] .atlas-shell .compact-field input::placeholder {
+  color: #596675;
+}
+
 :root[data-atlas-mode="archive"] .atlas-shell .secret-input-wrap:focus-within {
   border-color: rgba(71, 124, 134, 0.58);
   box-shadow: 0 0 0 2px rgba(71, 124, 134, 0.16);
@@ -2635,15 +2900,22 @@ code {
   background: rgba(237, 240, 234, 0.9);
 }
 
+:root[data-atlas-mode="archive"] .summary-options-modal .icon-action:hover:not(:disabled) {
+  border-color: rgba(71, 124, 134, 0.42);
+  background: rgba(237, 240, 234, 0.9);
+}
+
 :root[data-atlas-mode="archive"] .atlas-shell .icon-action:disabled {
   color: #7a8796;
   background: rgba(237, 240, 234, 0.74);
 }
 
 :root[data-atlas-mode="archive"] .atlas-shell .atlas-select-trigger:hover,
+:root[data-atlas-mode="archive"] .summary-options-modal .atlas-select-trigger:hover,
 :root[data-atlas-mode="archive"] .atlas-shell .search-box:hover,
 :root[data-atlas-mode="archive"] .atlas-shell .icon-button:hover,
 :root[data-atlas-mode="archive"] .atlas-shell .secondary-action:hover,
+:root[data-atlas-mode="archive"] .summary-options-modal .secondary-action:hover,
 :root[data-atlas-mode="archive"] .theme-toggle:hover {
   background: rgba(237, 240, 234, 0.86);
 }

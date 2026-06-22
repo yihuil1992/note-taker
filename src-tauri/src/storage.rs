@@ -96,6 +96,7 @@ pub fn initialize_database(path: &Path) -> Result<()> {
             ('openai_transcription_model', 'gpt-4o-mini-transcribe'),
             ('language_hint', 'zh'),
             ('summary_language', 'auto'),
+            ('reference_projects_json', '[]'),
             ('custom_glossary', ''),
             ('recording_consent_reminder_dismissed', 'false');
         "#,
@@ -259,6 +260,7 @@ pub struct AppSettingsRecord {
     pub openai_transcription_model: String,
     pub language_hint: String,
     pub summary_language: String,
+    pub reference_projects_json: String,
     pub custom_glossary: String,
     pub recording_consent_reminder_dismissed: bool,
 }
@@ -748,6 +750,8 @@ pub fn get_app_settings(path: &Path) -> Result<AppSettingsRecord> {
     let language_hint = get_setting(path, "language_hint")?.unwrap_or_else(|| "zh".to_string());
     let summary_language =
         get_setting(path, "summary_language")?.unwrap_or_else(|| "auto".to_string());
+    let reference_projects_json =
+        get_setting(path, "reference_projects_json")?.unwrap_or_else(|| "[]".to_string());
     let custom_glossary = get_setting(path, "custom_glossary")?.unwrap_or_default();
     let recording_consent_reminder_dismissed =
         get_setting(path, "recording_consent_reminder_dismissed")?
@@ -763,6 +767,7 @@ pub fn get_app_settings(path: &Path) -> Result<AppSettingsRecord> {
         openai_transcription_model,
         language_hint,
         summary_language,
+        reference_projects_json,
         custom_glossary,
         recording_consent_reminder_dismissed,
     })
