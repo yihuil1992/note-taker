@@ -93,7 +93,7 @@ pub fn initialize_database(path: &Path) -> Result<()> {
             ('summary_provider', 'codex-cli'),
             ('summary_model', 'gpt-5.4'),
             ('local_transcription_model', 'large-v3-turbo'),
-            ('openai_transcription_model', 'gpt-4o-mini-transcribe'),
+            ('openai_transcription_model', 'gpt-4o-transcribe'),
             ('language_hint', 'zh'),
             ('summary_language', 'auto'),
             ('reference_projects_json', '[]'),
@@ -103,6 +103,10 @@ pub fn initialize_database(path: &Path) -> Result<()> {
     )?;
     connection.execute(
         "UPDATE app_settings SET value = 'large-v3-turbo', updated_at = CURRENT_TIMESTAMP WHERE key = 'local_transcription_model' AND value IN ('tiny', 'large-v3')",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE app_settings SET value = 'gpt-4o-transcribe', updated_at = CURRENT_TIMESTAMP WHERE key = 'openai_transcription_model' AND value = 'gpt-4o-mini-transcribe'",
         [],
     )?;
     ensure_column(&connection, "meetings", "archived_at", "TEXT")?;

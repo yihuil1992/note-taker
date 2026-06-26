@@ -1,10 +1,13 @@
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 const TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
-const DEFAULT_TRANSCRIPTION_MODEL: &str = "gpt-4o-mini-transcribe";
+const DEFAULT_TRANSCRIPTION_MODEL: &str = "gpt-4o-transcribe";
+const MAX_TRANSCRIPTION_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Error)]
 pub enum OpenAiTranscriptionError {
@@ -57,42 +60,105 @@ pub fn transcribe_audio_file(
     fs::create_dir_all(output_dir)?;
 
     let model = normalize_model(model);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
+
+    let mut final_error: Option<OpenAiTranscriptionError> = None;
+    for attempt in 0..MAX_TRANSCRIPTION_ATTEMPTS {
+        let form = build_transcription_form(input_path, model, language_hint, custom_glossary)?;
+        let response = match client
+            .post(TRANSCRIPTIONS_URL)
+            .bearer_auth(&api_key)
+            .multipart(form)
+            .send()
+        {
+            Ok(response) => response,
+            Err(error)
+                if is_retryable_http_error(&error) && attempt + 1 < MAX_TRANSCRIPTION_ATTEMPTS =>
+            {
+                sleep_before_retry(attempt);
+                continue;
+            }
+            Err(error) => return Err(OpenAiTranscriptionError::Http(error)),
+        };
+        let status = response.status();
+        let body = response.text()?;
+        if status.is_success() {
+            let output_json_path = output_path(output_dir, input_path);
+            fs::write(&output_json_path, &body)?;
+            let parsed: TranscriptionResponse = serde_json::from_str(&body)?;
+            let transcript_text = parsed.text.unwrap_or_default();
+
+            return Ok(OpenAiTranscriptionResult {
+                model: model.to_string(),
+                transcript_text,
+                output_json_path: output_json_path.display().to_string(),
+            });
+        }
+
+        let api_error = OpenAiTranscriptionError::Api {
+            status: status.as_u16(),
+            body,
+        };
+        if is_retryable_status(status.as_u16()) && attempt + 1 < MAX_TRANSCRIPTION_ATTEMPTS {
+            final_error = Some(api_error);
+            sleep_before_retry(attempt);
+            continue;
+        }
+        return Err(api_error);
+    }
+
+    Err(
+        final_error.unwrap_or_else(|| OpenAiTranscriptionError::Api {
+            status: 0,
+            body: "OpenAI transcription failed after retries".to_string(),
+        }),
+    )
+}
+
+fn build_transcription_form(
+    input_path: &Path,
+    model: &str,
+    language_hint: &str,
+    custom_glossary: &str,
+) -> Result<reqwest::blocking::multipart::Form, OpenAiTranscriptionError> {
     let mut form = reqwest::blocking::multipart::Form::new()
         .file("file", input_path)?
         .text("model", model.to_string())
         .text("response_format", "json");
 
+    if use_server_chunking(model) {
+        form = form.text("chunking_strategy", "auto");
+    }
     if let Some(language) = normalize_language_hint(language_hint) {
         form = form.text("language", language.to_string());
     }
     if let Some(prompt) = transcription_prompt(language_hint, custom_glossary) {
         form = form.text("prompt", prompt);
     }
+    Ok(form)
+}
 
-    let response = reqwest::blocking::Client::new()
-        .post(TRANSCRIPTIONS_URL)
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()?;
-    let status = response.status();
-    let body = response.text()?;
-    if !status.is_success() {
-        return Err(OpenAiTranscriptionError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
+fn use_server_chunking(model: &str) -> bool {
+    matches!(model, "gpt-4o-transcribe" | "gpt-4o-mini-transcribe")
+}
 
-    let output_json_path = output_path(output_dir, input_path);
-    fs::write(&output_json_path, &body)?;
-    let parsed: TranscriptionResponse = serde_json::from_str(&body)?;
-    let transcript_text = parsed.text.unwrap_or_default();
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
 
-    Ok(OpenAiTranscriptionResult {
-        model: model.to_string(),
-        transcript_text,
-        output_json_path: output_json_path.display().to_string(),
-    })
+fn is_retryable_http_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout()
+}
+
+fn sleep_before_retry(attempt: usize) {
+    let millis = match attempt {
+        0 => 600,
+        1 => 1_500,
+        _ => 3_000,
+    };
+    thread::sleep(Duration::from_millis(millis));
 }
 
 fn normalize_model(model: &str) -> &'static str {
@@ -156,13 +222,32 @@ fn output_path(output_dir: &Path, input_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_model, normalize_model, transcription_prompt};
+    use super::{
+        default_model, is_retryable_status, normalize_model, transcription_prompt,
+        use_server_chunking,
+    };
 
     #[test]
-    fn defaults_to_mini_transcribe_for_unknown_models() {
-        assert_eq!(default_model(), "gpt-4o-mini-transcribe");
-        assert_eq!(normalize_model("not-a-model"), "gpt-4o-mini-transcribe");
+    fn defaults_to_quality_transcribe_for_unknown_models() {
+        assert_eq!(default_model(), "gpt-4o-transcribe");
+        assert_eq!(normalize_model("not-a-model"), "gpt-4o-transcribe");
         assert_eq!(normalize_model("gpt-4o-transcribe"), "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn uses_server_chunking_for_4o_transcription_models() {
+        assert!(use_server_chunking("gpt-4o-transcribe"));
+        assert!(use_server_chunking("gpt-4o-mini-transcribe"));
+        assert!(!use_server_chunking("whisper-1"));
+    }
+
+    #[test]
+    fn retries_rate_limit_and_server_errors() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
     }
 
     #[test]

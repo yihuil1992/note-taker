@@ -214,7 +214,11 @@ pub fn transcribe_meeting_chunks(
     let settings = get_app_settings(database_path)?;
     let chunks = list_audio_chunks_for_meeting(database_path, meeting_id)?;
     let window_dir = transcriptions_dir.join("windows").join(meeting_id);
-    let windows = crate::smart_chunks::build_transcription_windows(&chunks, &window_dir)?;
+    let windows = crate::smart_chunks::build_transcription_windows_for_provider(
+        &chunks,
+        &window_dir,
+        &settings.transcription_provider,
+    )?;
     let mut segments = Vec::new();
     let mut failures = Vec::new();
     let mut empty_chunks = 0;
