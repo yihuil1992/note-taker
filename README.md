@@ -30,7 +30,7 @@ Built with Tauri 2 (Rust backend) and React.
 - **Structured summaries via Codex CLI** — transcripts are sent to Codex CLI and distilled into a suggested title, overview, topics, decisions, action items with owners, open questions, and an outline. Long-running transcribe/summarize tasks can be cancelled mid-flight.
 - **Everything in SQLite** — meetings, chunks, transcript segments, summaries, and settings live in one local database, with search across titles, summaries, action items, and transcript text. Archive a meeting to hide it without deleting anything.
 - **Chinese-friendly** — multilingual model by default, glossary prompting works in Chinese, and Traditional output is normalized to Simplified via OpenCC.
-- **Optional OpenAI transcription** — opt in to `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, or `whisper-1`. Your API key is stored in Windows Credential Manager, never in the database, and any failed cloud window automatically falls back to local Whisper.
+- **Optional OpenAI transcription** — opt in to higher-quality `gpt-4o-transcribe` by default, or switch to `gpt-4o-mini-transcribe` / `whisper-1`. Your API key is stored in Windows Credential Manager, never in the database, and any failed cloud window automatically falls back to local Whisper.
 - **Quality-of-life** — mini always-on-top recorder window, two themes (Archive Sheet / Night Atlas), Markdown and JSON export, signed in-app auto-updates from GitHub Releases.
 
 Not there yet: recording does not survive closing the window (no tray mode), and transcripts/summaries are read-only in the UI.

@@ -1,4 +1,4 @@
-use note_taker_lib::smart_chunks::build_transcription_windows;
+use note_taker_lib::smart_chunks::build_transcription_windows_for_provider;
 use note_taker_lib::storage::{initialize_database, list_audio_chunks_for_meeting};
 use serde::Serialize;
 use std::env;
@@ -20,7 +20,9 @@ fn main() {
     let meeting_id = match env::args().nth(1) {
         Some(value) => value,
         None => {
-            eprintln!("Usage: pnpm meeting:windows <meeting-id> [app-data-dir]");
+            eprintln!(
+                "Usage: pnpm meeting:windows <meeting-id> [app-data-dir] [transcription-provider]"
+            );
             std::process::exit(2);
         }
     };
@@ -28,6 +30,9 @@ fn main() {
         .nth(2)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target").join("meeting-demo"));
+    let transcription_provider = env::args()
+        .nth(3)
+        .unwrap_or_else(|| "local-whisper".to_string());
     let database_path = app_data_dir.join("note-taker.sqlite3");
     let output_dir = app_data_dir
         .join("transcriptions")
@@ -38,7 +43,8 @@ fn main() {
         .and_then(|_| list_audio_chunks_for_meeting(&database_path, &meeting_id))
         .map_err(|error| error.to_string())
         .and_then(|chunks| {
-            build_transcription_windows(&chunks, &output_dir).map_err(|error| error.to_string())
+            build_transcription_windows_for_provider(&chunks, &output_dir, &transcription_provider)
+                .map_err(|error| error.to_string())
         });
 
     match result {

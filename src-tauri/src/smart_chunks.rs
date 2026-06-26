@@ -14,12 +14,22 @@ const MICROPHONE_TARGET_WINDOW_MS: i64 = 24_000;
 const MICROPHONE_MAX_WINDOW_MS: i64 = 30_000;
 const SYSTEM_TARGET_WINDOW_MS: i64 = 16_000;
 const SYSTEM_MAX_WINDOW_MS: i64 = 20_000;
+const OPENAI_TARGET_WINDOW_MS: i64 = 75_000;
+const OPENAI_MAX_WINDOW_MS: i64 = 90_000;
 const PRE_ROLL_MS: i64 = 1_000;
 const POST_ROLL_MS: i64 = 1_000;
+const OPENAI_PRE_ROLL_MS: i64 = 750;
+const OPENAI_POST_ROLL_MS: i64 = 750;
 const DOMINANCE_RATIO: f64 = 1.25;
 const TARGET_WINDOW_RMS: f64 = 0.045;
 const MAX_NORMALIZATION_GAIN: f64 = 3.0;
 const MIN_NORMALIZATION_RMS: f64 = 0.008;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowProfile {
+    LocalWhisper,
+    OpenAi,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct WindowPolicy {
@@ -93,13 +103,33 @@ pub fn build_transcription_windows(
     chunks: &[AudioChunkRecord],
     output_dir: &Path,
 ) -> Result<Vec<TranscriptionWindow>, SmartChunkError> {
+    build_transcription_windows_with_profile(chunks, output_dir, WindowProfile::LocalWhisper)
+}
+
+pub fn build_transcription_windows_for_provider(
+    chunks: &[AudioChunkRecord],
+    output_dir: &Path,
+    transcription_provider: &str,
+) -> Result<Vec<TranscriptionWindow>, SmartChunkError> {
+    let profile = match transcription_provider {
+        "openai-api" => WindowProfile::OpenAi,
+        _ => WindowProfile::LocalWhisper,
+    };
+    build_transcription_windows_with_profile(chunks, output_dir, profile)
+}
+
+fn build_transcription_windows_with_profile(
+    chunks: &[AudioChunkRecord],
+    output_dir: &Path,
+    profile: WindowProfile,
+) -> Result<Vec<TranscriptionWindow>, SmartChunkError> {
     fs::create_dir_all(output_dir)?;
     let timelines = build_source_timelines(chunks)?;
     if timelines.is_empty() {
         return Ok(Vec::new());
     }
 
-    let runs = build_turn_runs(&timelines);
+    let runs = build_turn_runs(&timelines, profile);
     let mut windows = Vec::new();
     for run in runs {
         if let Some(timeline) = timelines.get(&run.source_kind) {
@@ -108,6 +138,7 @@ pub fn build_transcription_windows(
                 output_dir,
                 run.start_ms,
                 run.end_ms,
+                profile,
             )?);
         }
     }
@@ -179,7 +210,10 @@ fn concatenate_source_chunks(source_kind: &str, chunks: &[ChunkAudio]) -> Option
     Some(timeline)
 }
 
-fn build_turn_runs(timelines: &BTreeMap<String, SourceTimeline>) -> Vec<SourceRun> {
+fn build_turn_runs(
+    timelines: &BTreeMap<String, SourceTimeline>,
+    profile: WindowProfile,
+) -> Vec<SourceRun> {
     let start_ms = timelines
         .values()
         .map(|timeline| timeline.started_at_ms)
@@ -235,7 +269,10 @@ fn build_turn_runs(timelines: &BTreeMap<String, SourceTimeline>) -> Vec<SourceRu
         push_run(&mut raw_runs, source, active_start, end);
     }
 
-    split_long_runs(merge_context_runs(merge_short_gaps(raw_runs)))
+    split_long_runs(
+        merge_context_runs(merge_short_gaps(raw_runs, profile), profile),
+        profile,
+    )
 }
 
 fn dominant_source(
@@ -286,11 +323,11 @@ fn push_run(runs: &mut Vec<SourceRun>, source_kind: String, start_ms: i64, end_m
     }
 }
 
-fn merge_short_gaps(runs: Vec<SourceRun>) -> Vec<SourceRun> {
+fn merge_short_gaps(runs: Vec<SourceRun>, profile: WindowProfile) -> Vec<SourceRun> {
     let mut merged: Vec<SourceRun> = Vec::new();
     for run in runs {
         if let Some(previous) = merged.last_mut() {
-            let policy = window_policy(&run.source_kind);
+            let policy = window_policy(&run.source_kind, profile);
             if previous.source_kind == run.source_kind
                 && run.start_ms - previous.end_ms <= policy.same_source_gap_ms
             {
@@ -303,11 +340,11 @@ fn merge_short_gaps(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     merged
 }
 
-fn merge_context_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
+fn merge_context_runs(runs: Vec<SourceRun>, profile: WindowProfile) -> Vec<SourceRun> {
     let mut merged: Vec<SourceRun> = Vec::new();
     for run in runs {
         if let Some(previous) = merged.last_mut() {
-            let policy = window_policy(&run.source_kind);
+            let policy = window_policy(&run.source_kind, profile);
             let same_source = previous.source_kind == run.source_kind;
             let short_gap = run.start_ms - previous.end_ms <= policy.same_source_gap_ms;
             let combined = run.end_ms - previous.start_ms;
@@ -321,10 +358,10 @@ fn merge_context_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     merged
 }
 
-fn split_long_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
+fn split_long_runs(runs: Vec<SourceRun>, profile: WindowProfile) -> Vec<SourceRun> {
     let mut split = Vec::new();
     for run in runs {
-        let policy = window_policy(&run.source_kind);
+        let policy = window_policy(&run.source_kind, profile);
         let mut start = run.start_ms;
         while run.end_ms - start > policy.max_core_ms() {
             split.push(SourceRun {
@@ -345,7 +382,20 @@ fn split_long_runs(runs: Vec<SourceRun>) -> Vec<SourceRun> {
     split
 }
 
-fn window_policy(source_kind: &str) -> WindowPolicy {
+fn window_policy(source_kind: &str, profile: WindowProfile) -> WindowPolicy {
+    if profile == WindowProfile::OpenAi {
+        return WindowPolicy {
+            target_ms: OPENAI_TARGET_WINDOW_MS,
+            max_output_ms: OPENAI_MAX_WINDOW_MS,
+            same_source_gap_ms: match source_kind {
+                "system" => 3_000,
+                _ => 5_000,
+            },
+            pre_roll_ms: OPENAI_PRE_ROLL_MS,
+            post_roll_ms: OPENAI_POST_ROLL_MS,
+        };
+    }
+
     match source_kind {
         "system" => WindowPolicy {
             target_ms: SYSTEM_TARGET_WINDOW_MS,
@@ -369,8 +419,9 @@ fn write_window(
     output_dir: &Path,
     run_start_ms: i64,
     run_end_ms: i64,
+    profile: WindowProfile,
 ) -> Result<TranscriptionWindow, SmartChunkError> {
-    let policy = window_policy(&timeline.source_kind);
+    let policy = window_policy(&timeline.source_kind, profile);
     let absolute_start_ms = (run_start_ms - policy.pre_roll_ms).max(timeline.started_at_ms);
     let absolute_end_ms = (run_end_ms + policy.post_roll_ms).min(timeline.end_ms());
     let duration_ms = absolute_end_ms.saturating_sub(absolute_start_ms);
@@ -643,6 +694,31 @@ mod tests {
             |window| window.duration_ms <= SYSTEM_TARGET_WINDOW_MS + PRE_ROLL_MS + POST_ROLL_MS
         ));
         assert!(windows.iter().all(|window| window.duration_ms >= 6_000));
+
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn openai_profile_uses_longer_context_windows() {
+        let root = temp_root();
+        let input_dir = root.join("input");
+        let local_output_dir = root.join("local-output");
+        let openai_output_dir = root.join("openai-output");
+        let chunks = vec![chunk(&input_dir, "microphone", 0, 150_000, 4_000)];
+
+        let local_windows =
+            build_transcription_windows(&chunks, &local_output_dir).expect("build local windows");
+        let openai_windows =
+            build_transcription_windows_for_provider(&chunks, &openai_output_dir, "openai-api")
+                .expect("build openai windows");
+
+        assert!(openai_windows.len() < local_windows.len());
+        assert!(openai_windows
+            .iter()
+            .all(|window| window.duration_ms <= OPENAI_MAX_WINDOW_MS));
+        assert!(openai_windows
+            .iter()
+            .any(|window| window.duration_ms > MICROPHONE_MAX_WINDOW_MS));
 
         fs::remove_dir_all(root).expect("remove temp root");
     }

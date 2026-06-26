@@ -388,7 +388,7 @@ const defaultSettings: AppSettings = {
   summaryProvider: "codex-cli",
   summaryModel: "gpt-5.4",
   localTranscriptionModel: "large-v3-turbo",
-  openaiTranscriptionModel: "gpt-4o-mini-transcribe",
+  openaiTranscriptionModel: "gpt-4o-transcribe",
   languageHint: "zh",
   summaryLanguage: "auto",
   referenceProjectsJson: "[]",
@@ -416,8 +416,8 @@ const LOCAL_MODEL_OPTIONS: AtlasSelectOption[] = [
   { value: "large-v3", label: "large-v3 most accurate" }
 ];
 const OPENAI_TRANSCRIPTION_MODEL_OPTIONS: AtlasSelectOption[] = [
-  { value: "gpt-4o-mini-transcribe", label: "gpt-4o-mini-transcribe" },
   { value: "gpt-4o-transcribe", label: "gpt-4o-transcribe" },
+  { value: "gpt-4o-mini-transcribe", label: "gpt-4o-mini-transcribe" },
   { value: "whisper-1", label: "whisper-1" }
 ];
 const SUMMARY_MODEL_OPTIONS: AtlasSelectOption[] = [
