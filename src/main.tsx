@@ -1619,7 +1619,7 @@ function App() {
       <footer className="atlas-footer">
         <span className="privacy-dot" />
         <strong>{settings.transcriptionProvider === "openai-api" ? "Cloud transcription on" : "Local by default"}</strong>
-        <span className="version-pill">v{status?.appVersion ?? "0.2.4"}</span>
+        <span className="version-pill">v{status?.appVersion ?? "0.2.7"}</span>
         <span>{settings.transcriptionProvider === "openai-api" ? "Audio windows are sent to OpenAI for transcription." : "Audio and transcripts stay on this device unless you choose cloud transcription."}</span>
         <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
           <RefreshCw size={14} aria-hidden="true" />
@@ -2786,7 +2786,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   if (command === "get_app_status") {
     const sidecar = mockSidecar(mockModelVerified, mockRuntimeInstalled);
     return {
-      appVersion: "0.2.4",
+      appVersion: "0.2.7",
       appDataDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker",
       databasePath: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\note-taker.sqlite3",
       recordingsDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\recordings",
@@ -3034,12 +3034,12 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "check_for_app_update") {
     return {
-      currentVersion: "0.2.4",
-      latestVersion: "v0.2.4",
+      currentVersion: "0.2.7",
+      latestVersion: "v0.2.7",
       updateAvailable: false,
       installable: false,
-      releaseName: "Note Taker v0.2.4",
-      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.4",
+      releaseName: "Note Taker v0.2.7",
+      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.7",
       publishedAt: "2026-06-12T22:47:08Z",
       notes: "You are running the latest release."
     } as T;
