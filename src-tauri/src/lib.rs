@@ -570,7 +570,15 @@ fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         "raw_audio_retention_days" => matches!(value, "0" | "7" | "30" | "365"),
         "transcription_provider" => matches!(value, "local-whisper" | "openai-api"),
         "summary_provider" => matches!(value, "codex-cli" | "openai-api" | "local-llm"),
-        "summary_model" => matches!(value, "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"),
+        "summary_model" => matches!(
+            value,
+            "gpt-5.4"
+                | "gpt-5.4-mini"
+                | "gpt-5.5"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
+        ),
         "local_transcription_model" => matches!(value, "large-v3-turbo" | "large-v3"),
         "openai_transcription_model" => matches!(
             value,
@@ -729,7 +737,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::cancel_status_transition;
+    use super::{cancel_status_transition, validate_setting};
 
     #[test]
     fn cancel_without_worker_clears_orphan_canceling_status() {
@@ -743,5 +751,17 @@ mod tests {
     fn cancel_with_worker_keeps_canceling_status() {
         assert_eq!(cancel_status_transition("summarizing", true), "canceling");
         assert_eq!(cancel_status_transition("transcribing", true), "canceling");
+    }
+
+    #[test]
+    fn accepts_codex_5_6_summary_model_variants() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(validate_setting("summary_model", model).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_generic_codex_5_6_summary_model() {
+        assert!(validate_setting("summary_model", "gpt-5.6").is_err());
     }
 }
