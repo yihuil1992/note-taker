@@ -423,7 +423,10 @@ const OPENAI_TRANSCRIPTION_MODEL_OPTIONS: AtlasSelectOption[] = [
 const SUMMARY_MODEL_OPTIONS: AtlasSelectOption[] = [
   { value: "gpt-5.4", label: "gpt-5.4" },
   { value: "gpt-5.4-mini", label: "gpt-5.4-mini" },
-  { value: "gpt-5.5", label: "gpt-5.5" }
+  { value: "gpt-5.5", label: "gpt-5.5" },
+  { value: "gpt-5.6-sol", label: "gpt-5.6-sol" },
+  { value: "gpt-5.6-terra", label: "gpt-5.6-terra" },
+  { value: "gpt-5.6-luna", label: "gpt-5.6-luna" }
 ];
 const LANGUAGE_HINT_OPTIONS: AtlasSelectOption[] = [
   { value: "zh", label: "Chinese" },
