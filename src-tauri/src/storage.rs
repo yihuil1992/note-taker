@@ -202,6 +202,21 @@ pub struct MeetingListItem {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ArchivedMeetingListItem {
+    pub id: String,
+    pub title: String,
+    pub started_at: String,
+    pub archived_at: String,
+    pub status: String,
+    pub summary_overview: Option<String>,
+    pub chunk_count: i64,
+    pub segment_count: i64,
+    pub action_item_count: usize,
+    pub topic_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioChunkRecord {
     pub id: String,
     pub meeting_id: String,
@@ -387,6 +402,46 @@ pub fn list_recent_meetings(path: &Path, limit: usize) -> Result<Vec<MeetingList
     )?;
 
     let rows = statement.query_map(params![limit], row_to_meeting_list_item)?;
+    collect_rows(rows)
+}
+
+pub fn list_archived_meetings(path: &Path, limit: usize) -> Result<Vec<ArchivedMeetingListItem>> {
+    let connection = Connection::open(path)?;
+    let limit = limit.clamp(1, 200) as i64;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT
+            m.id,
+            m.title,
+            m.started_at,
+            strftime('%Y-%m-%dT%H:%M:%SZ', m.archived_at),
+            m.status,
+            s.overview,
+            COALESCE(chunk_counts.count, 0),
+            COALESCE(segment_counts.count, 0),
+            s.action_items_json,
+            s.topics_json
+        FROM meetings m
+        LEFT JOIN meeting_summaries s ON s.meeting_id = m.id
+        LEFT JOIN (
+            SELECT meeting_id, COUNT(*) AS count FROM audio_chunks GROUP BY meeting_id
+        ) chunk_counts ON chunk_counts.meeting_id = m.id
+        LEFT JOIN (
+            SELECT meeting_id, COUNT(*) AS count
+            FROM (
+                SELECT meeting_id, source_kind, speaker_label, language, start_ms, text, provider
+                FROM transcript_segments
+                GROUP BY meeting_id, source_kind, speaker_label, language, start_ms, text, provider
+            )
+            GROUP BY meeting_id
+        ) segment_counts ON segment_counts.meeting_id = m.id
+        WHERE m.archived_at IS NOT NULL
+        ORDER BY m.archived_at DESC, m.started_at DESC
+        LIMIT ?1
+        "#,
+    )?;
+
+    let rows = statement.query_map(params![limit], row_to_archived_meeting_list_item)?;
     collect_rows(rows)
 }
 
@@ -854,6 +909,22 @@ pub fn archive_meeting(path: &Path, meeting_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn restore_meeting(path: &Path, meeting_id: &str) -> Result<()> {
+    let mut connection = Connection::open(path)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        r#"
+        UPDATE meetings
+        SET archived_at = NULL, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1 AND archived_at IS NOT NULL
+        "#,
+        params![meeting_id],
+    )?;
+    rebuild_meeting_search_with_connection(&transaction, meeting_id)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn get_setting(path: &Path, key: &str) -> Result<Option<String>> {
     let connection = Connection::open(path)?;
     connection
@@ -964,6 +1035,23 @@ fn row_to_meeting_list_item(row: &rusqlite::Row<'_>) -> Result<MeetingListItem> 
     })
 }
 
+fn row_to_archived_meeting_list_item(row: &rusqlite::Row<'_>) -> Result<ArchivedMeetingListItem> {
+    let action_items_json: Option<String> = row.get(8)?;
+    let topics_json: Option<String> = row.get(9)?;
+    Ok(ArchivedMeetingListItem {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        started_at: row.get(2)?,
+        archived_at: row.get(3)?,
+        status: row.get(4)?,
+        summary_overview: row.get(5)?,
+        chunk_count: row.get(6)?,
+        segment_count: row.get(7)?,
+        action_item_count: json_array_len(action_items_json.as_deref()),
+        topic_count: json_array_len(topics_json.as_deref()),
+    })
+}
+
 fn collect_rows<T>(rows: impl Iterator<Item = Result<T>>) -> Result<Vec<T>> {
     let mut items = Vec::new();
     for row in rows {
@@ -976,4 +1064,138 @@ fn json_array_len(raw: Option<&str>) -> usize {
     raw.and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
         .and_then(|value| value.as_array().map(Vec::len))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        archive_meeting, initialize_database, list_archived_meetings, list_recent_meetings,
+        restore_meeting,
+    };
+    use rusqlite::{params, Connection};
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn archived_meetings_can_be_listed_and_restored_with_search_index() {
+        let database_path = std::env::temp_dir().join(format!(
+            "note-taker-archive-restore-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        initialize_database(&database_path).expect("initialize test database");
+
+        let connection = Connection::open(&database_path).expect("open test database");
+        connection
+            .execute(
+                "INSERT INTO meetings (id, title, started_at, status) VALUES (?1, ?2, ?3, 'summarized')",
+                params!["restore-target", "Restore target", "2026-08-17T13:05:00Z"],
+            )
+            .expect("insert restore target");
+        connection
+            .execute(
+                "INSERT INTO meetings (id, title, started_at, status, archived_at) VALUES (?1, ?2, ?3, 'recorded', ?4)",
+                params![
+                    "older-archive",
+                    "Older archive",
+                    "2026-08-16T13:05:00Z",
+                    "2026-08-16 15:00:00"
+                ],
+            )
+            .expect("insert older archived meeting");
+        connection
+            .execute(
+                r#"
+                INSERT INTO meeting_summaries (
+                    meeting_id, suggested_title, provider, model, language, overview,
+                    decisions_json, action_items_json, topics_json, risks_or_questions_json, raw_json
+                ) VALUES (?1, ?2, 'codex-cli', 'test-model', 'en', ?3, '[]', ?4, ?5, '[]', '{}')
+                "#,
+                params![
+                    "restore-target",
+                    "Restore target",
+                    "Archived summary",
+                    "[{\"task\":\"Restore it\"}]",
+                    "[\"Archive\"]"
+                ],
+            )
+            .expect("insert summary");
+        connection
+            .execute(
+                r#"
+                INSERT INTO transcript_segments (
+                    id, meeting_id, source_kind, speaker_label, language,
+                    start_ms, end_ms, text, provider
+                ) VALUES ('segment-1', 'restore-target', 'microphone', 'Me', 'en', 0, 1000, 'Searchable transcript', 'test')
+                "#,
+                [],
+            )
+            .expect("insert transcript");
+        connection
+            .execute(
+                "INSERT INTO meeting_search (meeting_id, title, summary, action_items, topics, transcript) VALUES (?1, ?2, ?3, '', '', ?4)",
+                params![
+                    "restore-target",
+                    "Restore target",
+                    "Archived summary",
+                    "Searchable transcript"
+                ],
+            )
+            .expect("seed search row");
+        drop(connection);
+
+        archive_meeting(&database_path, "restore-target").expect("archive target");
+        let connection = Connection::open(&database_path).expect("reopen test database");
+        connection
+            .execute(
+                "UPDATE meetings SET archived_at = '2026-08-17 15:00:00' WHERE id = 'restore-target'",
+                [],
+            )
+            .expect("set deterministic archive time");
+        let search_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM meeting_search WHERE meeting_id = 'restore-target'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count archived search rows");
+        assert_eq!(search_rows, 0);
+        drop(connection);
+
+        let archived = list_archived_meetings(&database_path, 20).expect("list archived meetings");
+        assert_eq!(archived.len(), 2);
+        assert_eq!(archived[0].id, "restore-target");
+        assert_eq!(archived[0].archived_at, "2026-08-17T15:00:00Z");
+        assert_eq!(archived[0].action_item_count, 1);
+        assert_eq!(archived[0].topic_count, 1);
+
+        restore_meeting(&database_path, "restore-target").expect("restore target");
+        restore_meeting(&database_path, "restore-target").expect("restore remains idempotent");
+
+        let remaining =
+            list_archived_meetings(&database_path, 20).expect("list remaining archives");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "older-archive");
+        let recent = list_recent_meetings(&database_path, 20).expect("list recent meetings");
+        assert!(recent.iter().any(|meeting| meeting.id == "restore-target"));
+
+        let connection = Connection::open(&database_path).expect("verify restored database");
+        let restored_search: (String, String) = connection
+            .query_row(
+                "SELECT summary, transcript FROM meeting_search WHERE meeting_id = 'restore-target'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read restored search row");
+        assert_eq!(restored_search.0, "Archived summary");
+        assert_eq!(restored_search.1, "Searchable transcript");
+        drop(connection);
+
+        for path in [
+            database_path.clone(),
+            database_path.with_extension("sqlite3-wal"),
+            database_path.with_extension("sqlite3-shm"),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
 }

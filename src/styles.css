@@ -426,6 +426,8 @@ code {
   border-radius: var(--radius-md);
   border: 1px solid transparent;
   color: var(--ink-soft);
+  background: transparent;
+  cursor: pointer;
   font-size: 14px;
   font-weight: 660;
   letter-spacing: 0.08em;
@@ -1432,6 +1434,236 @@ code {
   margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.archived-meetings-modal {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(780px, 100%);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--ink);
+  background: var(--surface-solid);
+  box-shadow: 0 6px 8px rgba(0, 0, 0, 0.28);
+  animation: surface-in 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.archived-meetings-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.archived-meetings-mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  background: var(--surface-soft);
+}
+
+.archived-meetings-header h2,
+.archived-meetings-header p {
+  margin: 0;
+}
+
+.archived-meetings-header h2 {
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 740;
+  line-height: 1.25;
+}
+
+.archived-meetings-header p {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.archived-meetings-modal .icon-action,
+.archived-meetings-modal .secondary-action {
+  border-color: var(--line);
+  color: var(--ink-soft);
+  background: var(--surface-soft);
+}
+
+.archived-meetings-modal .icon-action:hover:not(:disabled),
+.archived-meetings-modal .secondary-action:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: var(--ink);
+  background: var(--surface-tint);
+}
+
+.archived-meetings-body {
+  min-height: 220px;
+  overflow: auto;
+  padding: 0 18px;
+  scrollbar-color: var(--line-strong) transparent;
+  scrollbar-width: thin;
+}
+
+.archived-meeting-list {
+  display: grid;
+}
+
+.archived-meeting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.archived-meeting-row:last-child {
+  border-bottom: 0;
+}
+
+.archived-meeting-copy {
+  min-width: 0;
+}
+
+.archived-meeting-dates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: var(--muted);
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.archived-meeting-dates span:last-child {
+  color: var(--accent);
+}
+
+.archived-meeting-copy h3,
+.archived-meeting-copy p,
+.archived-meeting-copy small {
+  margin: 0;
+}
+
+.archived-meeting-copy h3 {
+  margin-top: 7px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 740;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.archived-meeting-copy p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin-top: 5px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.archived-meeting-copy small {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.archive-restore-action {
+  min-width: 148px;
+  white-space: nowrap;
+}
+
+.archive-dialog-error,
+.archive-loading {
+  margin: 18px 0;
+}
+
+.archive-dialog-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--ink-soft);
+  background: var(--surface-soft);
+}
+
+.archive-dialog-error strong,
+.archive-dialog-error p {
+  margin: 0;
+}
+
+.archive-dialog-error strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.archive-dialog-error p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.archive-loading {
+  display: grid;
+}
+
+.archive-loading-row {
+  display: grid;
+  gap: 8px;
+  padding: 17px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.archive-loading-row span {
+  height: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+  animation: archive-loading-pulse 1.4s ease-in-out infinite;
+}
+
+.archive-loading-row span:nth-child(1) {
+  width: 34%;
+}
+
+.archive-loading-row span:nth-child(2) {
+  width: 62%;
+  height: 14px;
+}
+
+.archive-loading-row span:nth-child(3) {
+  width: 78%;
+}
+
+.archived-meetings-body > .empty-state {
+  margin: 18px 0;
+}
+
+.archived-meetings-footer {
+  padding: 10px 18px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--surface-soft);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .summary-options-grid {
@@ -3277,6 +3509,17 @@ code {
   }
 }
 
+@keyframes archive-loading-pulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -3289,6 +3532,51 @@ code {
 }
 
 @media (max-width: 680px) {
+  .modal-backdrop {
+    align-items: end;
+    padding: 10px;
+  }
+
+  .archived-meetings-modal {
+    max-height: calc(100vh - 20px);
+  }
+
+  .archived-meetings-header {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    padding: 14px;
+  }
+
+  .archived-meetings-header .count-pill {
+    display: none;
+  }
+
+  .archived-meetings-body {
+    padding: 0 14px;
+  }
+
+  .archived-meeting-row {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 15px 0;
+  }
+
+  .archive-restore-action {
+    width: 100%;
+  }
+
+  .archive-dialog-error {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .archive-dialog-error .secondary-action {
+    width: 100%;
+  }
+
+  .archived-meetings-footer {
+    padding: 10px 14px;
+  }
+
   .atlas-header {
     padding: 14px 12px;
   }

@@ -36,8 +36,10 @@ use std::process::Command as ProcessCommand;
 use storage::{
     archive_meeting as archive_meeting_record, get_app_settings as load_app_settings,
     get_meeting as load_meeting, get_meeting_detail as load_meeting_detail, initialize_database,
-    list_recent_meetings, search_meetings as search_meeting_records, set_app_setting,
-    update_meeting_status, AppSettingsRecord, MeetingDetailRecord, MeetingListItem,
+    list_archived_meetings as list_archived_meeting_records, list_recent_meetings,
+    restore_meeting as restore_meeting_record, search_meetings as search_meeting_records,
+    set_app_setting, update_meeting_status, AppSettingsRecord, ArchivedMeetingListItem,
+    MeetingDetailRecord, MeetingListItem,
 };
 use summary::{
     summarize_meeting_with_options, MeetingSummaryResult, ReferenceProject, SummaryRunOptions,
@@ -372,6 +374,26 @@ fn archive_meeting(app: tauri::AppHandle, meeting_id: String) -> Result<(), Stri
     paths.ensure()?;
     initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
     archive_meeting_record(&paths.database_path, &meeting_id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_archived_meetings(
+    app: tauri::AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<ArchivedMeetingListItem>, String> {
+    let paths = AppPaths::resolve(&app)?;
+    paths.ensure()?;
+    initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
+    list_archived_meeting_records(&paths.database_path, limit.unwrap_or(100))
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn restore_meeting(app: tauri::AppHandle, meeting_id: String) -> Result<(), String> {
+    let paths = AppPaths::resolve(&app)?;
+    paths.ensure()?;
+    initialize_database(&paths.database_path).map_err(|error| error.to_string())?;
+    restore_meeting_record(&paths.database_path, &meeting_id).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -715,6 +737,8 @@ pub fn run() {
             get_meeting_detail,
             search_meetings,
             archive_meeting,
+            list_archived_meetings,
+            restore_meeting,
             export_meeting_as_markdown,
             export_meeting_as_json,
             get_app_settings,
