@@ -228,6 +228,7 @@ Depth is mostly structural: rails, borders, and tonal surfaces establish the app
 - **Content:** title, time, short summary, and real counts only.
 - **Rule:** rows may truncate long titles with ellipsis, but they must not invent attendees, owners, or calendar context.
 - **Archive action:** archive is a soft hide action, not deletion. Use a direct `Archive` control with explanatory tooltip copy instead of destructive color.
+- **Archive browser:** the top `Archive` navigation control opens the archived-meeting dialog. Rows show real meeting/archive timestamps and stored counts; `Restore meeting` returns a record to the normal index and search without changing local files.
 
 ### Capture Console
 

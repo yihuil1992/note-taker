@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   Archive,
+  ArchiveRestore,
   ChevronDown,
   CheckCircle2,
   Clock3,
@@ -150,6 +151,19 @@ type MeetingListItem = {
   titleSource: string;
   startedAt: string;
   endedAt?: string | null;
+  status: string;
+  summaryOverview?: string | null;
+  chunkCount: number;
+  segmentCount: number;
+  actionItemCount: number;
+  topicCount: number;
+};
+
+type ArchivedMeetingListItem = {
+  id: string;
+  title: string;
+  startedAt: string;
+  archivedAt: string;
   status: string;
   summaryOverview?: string | null;
   chunkCount: number;
@@ -470,6 +484,11 @@ function App() {
   const [settings, setSettings] = React.useState<AppSettings>(defaultSettings);
   const [devices, setDevices] = React.useState<AudioDevice[]>([]);
   const [meetings, setMeetings] = React.useState<MeetingListItem[]>([]);
+  const [archivedMeetings, setArchivedMeetings] = React.useState<ArchivedMeetingListItem[]>([]);
+  const [archiveDialogOpen, setArchiveDialogOpen] = React.useState(false);
+  const [archiveDialogLoading, setArchiveDialogLoading] = React.useState(false);
+  const [archiveDialogError, setArchiveDialogError] = React.useState<string | null>(null);
+  const [restoringMeetingId, setRestoringMeetingId] = React.useState<string | null>(null);
   const [detail, setDetail] = React.useState<MeetingDetail | null>(null);
   const [selectedMeetingId, setSelectedMeetingId] = React.useState<string | null>(null);
   const [query, setQuery] = React.useState("");
@@ -496,6 +515,7 @@ function App() {
   const glossaryEntryCount = glossaryEntries.filter((entry) => entry.term.trim() || entry.description.trim()).length;
   const pendingUpdateRef = React.useRef<unknown>(null);
   const miniWindowSnapshotRef = React.useRef<WindowSnapshot | null>(null);
+  const archiveTriggerRef = React.useRef<HTMLButtonElement | null>(null);
 
   React.useEffect(() => {
     void refreshAll();
@@ -878,6 +898,49 @@ function App() {
     }
   }
 
+  async function loadArchivedMeetings() {
+    setArchiveDialogLoading(true);
+    setArchiveDialogError(null);
+    try {
+      const nextArchivedMeetings = await callBackend<ArchivedMeetingListItem[]>("list_archived_meetings", { limit: 100 });
+      setArchivedMeetings(nextArchivedMeetings);
+    } catch (archiveListError) {
+      setArchiveDialogError(String(archiveListError));
+    } finally {
+      setArchiveDialogLoading(false);
+    }
+  }
+
+  function openArchiveDialog() {
+    setArchiveDialogOpen(true);
+    void loadArchivedMeetings();
+  }
+
+  function closeArchiveDialog() {
+    setArchiveDialogOpen(false);
+    window.requestAnimationFrame(() => archiveTriggerRef.current?.focus());
+  }
+
+  async function restoreArchivedMeeting(meeting: ArchivedMeetingListItem) {
+    setRestoringMeetingId(meeting.id);
+    setArchiveDialogError(null);
+    try {
+      await callBackend<void>("restore_meeting", { meetingId: meeting.id });
+      const nextArchivedMeetings = await callBackend<ArchivedMeetingListItem[]>("list_archived_meetings", { limit: 100 });
+      setArchivedMeetings(nextArchivedMeetings);
+      setNotice(`Restored "${meeting.title}" to the meeting index.`);
+      if (query.trim()) {
+        await runSearch(query);
+      } else {
+        await refreshAll(selectedMeetingId);
+      }
+    } catch (restoreError) {
+      setArchiveDialogError(`Could not restore "${meeting.title}": ${String(restoreError)}`);
+    } finally {
+      setRestoringMeetingId(null);
+    }
+  }
+
   async function downloadRuntime() {
     setBusy("runtime");
     setError(null);
@@ -1147,7 +1210,16 @@ function App() {
         </a>
         <nav className="atlas-nav" aria-label="Primary navigation">
           <a className="nav-item active" href="#today"><Clock3 size={16} aria-hidden="true" /> Capture</a>
-          <a className="nav-item" href="#meetings"><Database size={16} aria-hidden="true" /> Archive</a>
+          <button
+            ref={archiveTriggerRef}
+            className="nav-item"
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded={archiveDialogOpen}
+            onClick={openArchiveDialog}
+          >
+            <Database size={16} aria-hidden="true" /> Archive
+          </button>
           <a className="nav-item" href="#settings"><Settings size={16} aria-hidden="true" /> Instruments</a>
         </nav>
         <div className="atlas-header-status">
@@ -1323,6 +1395,18 @@ function App() {
             onChange={(options) => setSummaryDialogOptions(options)}
             onClose={() => setSummaryDialogOptions(null)}
             onConfirm={(options) => void summarizeSelected(options)}
+          />
+        ) : null}
+
+        {archiveDialogOpen ? (
+          <ArchivedMeetingsDialog
+            meetings={archivedMeetings}
+            loading={archiveDialogLoading}
+            error={archiveDialogError}
+            restoringMeetingId={restoringMeetingId}
+            onClose={closeArchiveDialog}
+            onRetry={() => void loadArchivedMeetings()}
+            onRestore={(meeting) => void restoreArchivedMeeting(meeting)}
           />
         ) : null}
 
@@ -2044,6 +2128,161 @@ function MeetingDetailView({
   );
 }
 
+function ArchivedMeetingsDialog({
+  meetings,
+  loading,
+  error,
+  restoringMeetingId,
+  onClose,
+  onRetry,
+  onRestore
+}: {
+  meetings: ArchivedMeetingListItem[];
+  loading: boolean;
+  error: string | null;
+  restoringMeetingId: string | null;
+  onClose: () => void;
+  onRetry: () => void;
+  onRestore: (meeting: ArchivedMeetingListItem) => void;
+}) {
+  const dialogRef = React.useRef<HTMLElement | null>(null);
+
+  React.useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return undefined;
+    const focusableSelector = [
+      "button:not([disabled])",
+      "[href]",
+      "input:not([disabled])",
+      "select:not([disabled])",
+      "textarea:not([disabled])",
+      "[tabindex]:not([tabindex='-1'])"
+    ].join(",");
+    const focusFirstControl = () => {
+      const firstControl = dialog.querySelector<HTMLElement>(focusableSelector);
+      (firstControl ?? dialog).focus();
+    };
+    const focusFrame = window.requestAnimationFrame(focusFirstControl);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const controls = Array.from(dialog.querySelectorAll<HTMLElement>(focusableSelector));
+      if (controls.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  return createPortal(
+    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <section
+        ref={dialogRef}
+        className="archived-meetings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="archived-meetings-title"
+        aria-describedby="archived-meetings-description"
+        tabIndex={-1}
+      >
+        <header className="archived-meetings-header">
+          <span className="archived-meetings-mark" aria-hidden="true"><Database size={19} /></span>
+          <div>
+            <h2 id="archived-meetings-title">Archived meetings</h2>
+            <p id="archived-meetings-description">Restore a meeting to return it to the index and search.</p>
+          </div>
+          <span className="count-pill" aria-label={formatCount(meetings.length, "archived meeting")}>{meetings.length}</span>
+          <button className="icon-action" type="button" onClick={onClose} aria-label="Close archived meetings">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+
+        <div className="archived-meetings-body" aria-busy={loading}>
+          {loading ? (
+            <div className="archive-loading" aria-label="Loading archived meetings">
+              {[0, 1, 2].map((row) => (
+                <div className="archive-loading-row" key={row} aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              ))}
+            </div>
+          ) : error ? (
+            <div className="archive-dialog-error" role="alert">
+              <div>
+                <strong>Archive request failed.</strong>
+                <p>{error}</p>
+              </div>
+              <button className="secondary-action" type="button" onClick={onRetry}>
+                <RefreshCw size={15} aria-hidden="true" />
+                Refresh list
+              </button>
+            </div>
+          ) : meetings.length === 0 ? (
+            <EmptyState title="No archived meetings" text="Meetings you archive will appear here and can be restored later." />
+          ) : (
+            <div className="archived-meeting-list">
+              {meetings.map((meeting) => {
+                const restoring = restoringMeetingId === meeting.id;
+                return (
+                  <article className="archived-meeting-row" key={meeting.id}>
+                    <div className="archived-meeting-copy">
+                      <div className="archived-meeting-dates">
+                        <span>Meeting {formatDateTime(meeting.startedAt)}</span>
+                        <span>Archived {formatDateTime(meeting.archivedAt)}</span>
+                      </div>
+                      <h3>{meeting.title}</h3>
+                      <p>{meeting.summaryOverview || formatStatus(meeting.status)}</p>
+                      <small>{formatCount(meeting.segmentCount, "segment")} · {formatCount(meeting.actionItemCount, "action")} · {formatCount(meeting.chunkCount, "chunk")}</small>
+                    </div>
+                    <button
+                      className="secondary-action archive-restore-action"
+                      type="button"
+                      onClick={() => onRestore(meeting)}
+                      disabled={restoringMeetingId !== null}
+                      aria-label={`Restore meeting ${meeting.title}`}
+                    >
+                      <ArchiveRestore size={16} aria-hidden="true" />
+                      {restoring ? "Restoring..." : "Restore meeting"}
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <footer className="archived-meetings-footer">
+          <span>Restoring changes visibility only. Local files remain unchanged.</span>
+        </footer>
+      </section>
+    </div>,
+    document.body
+  );
+}
+
 function SummaryOptionsDialog({
   options,
   hasExistingSummary,
@@ -2746,8 +2985,13 @@ function formatDateTime(value: string): string {
   }).format(date);
 }
 
+function formatCount(count: number, unit: string): string {
+  return `${count} ${unit}${count === 1 ? "" : "s"}`;
+}
+
 async function callBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (window.__TAURI_INTERNALS__) {
+  const forceMockBackend = new URLSearchParams(window.location.search).get("mock") === "1";
+  if (window.__TAURI_INTERNALS__ && !forceMockBackend) {
     return invoke<T>(command, args);
   }
   return mockBackend<T>(command, args);
@@ -2774,9 +3018,15 @@ let mockMeetings: MeetingListItem[] = [
     topicCount: 3
   }
 ];
+const mockArchivedDetail = makeMockDetail("meeting-archived", "Weekly operations review", "summarized");
+mockArchivedDetail.meeting.startedAt = "2026-06-10T15:30:00Z";
+mockArchivedDetail.meeting.endedAt = "2026-06-10T16:08:00Z";
+mockArchivedDetail.meeting.archivedAt = "2026-06-12T18:42:00Z";
 let mockDetails: Record<string, MeetingDetail> = {
-  "meeting-1": makeMockDetail("meeting-1", "Local transcription smoke review", "summarized")
+  "meeting-1": makeMockDetail("meeting-1", "Local transcription smoke review", "summarized"),
+  "meeting-archived": mockArchivedDetail
 };
+let mockArchivedMeetings: ArchivedMeetingListItem[] = [toArchivedListItem(mockArchivedDetail)];
 
 async function mockBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   seedMockTaskProgress(command, args);
@@ -2847,6 +3097,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
     ] as T;
   }
   if (command === "list_meetings") return mockMeetings as T;
+  if (command === "list_archived_meetings") return mockArchivedMeetings as T;
   if (command === "search_meetings") {
     const query = String(args?.query ?? "").toLowerCase();
     return mockMeetings.filter((meeting) => `${meeting.title} ${meeting.summaryOverview ?? ""}`.toLowerCase().includes(query)) as T;
@@ -2858,8 +3109,22 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
     const id = String(args?.meetingId ?? "");
     if (mockDetails[id]) {
       mockDetails[id].meeting.archivedAt = new Date().toISOString();
+      mockArchivedMeetings = [
+        toArchivedListItem(mockDetails[id]),
+        ...mockArchivedMeetings.filter((meeting) => meeting.id !== id)
+      ];
     }
     mockMeetings = mockMeetings.filter((meeting) => meeting.id !== id);
+    return undefined as T;
+  }
+  if (command === "restore_meeting") {
+    const id = String(args?.meetingId ?? "");
+    const detail = mockDetails[id];
+    if (detail) {
+      detail.meeting.archivedAt = null;
+      mockMeetings = [toListItem(detail), ...mockMeetings.filter((meeting) => meeting.id !== id)];
+    }
+    mockArchivedMeetings = mockArchivedMeetings.filter((meeting) => meeting.id !== id);
     return undefined as T;
   }
   if (command === "start_recording") {
@@ -3300,6 +3565,22 @@ function toListItem(detail: MeetingDetail): MeetingListItem {
     segmentCount: detail.transcriptSegments.length,
     actionItemCount,
     topicCount
+  };
+}
+
+function toArchivedListItem(detail: MeetingDetail): ArchivedMeetingListItem {
+  const listItem = toListItem(detail);
+  return {
+    id: listItem.id,
+    title: listItem.title,
+    startedAt: listItem.startedAt,
+    archivedAt: detail.meeting.archivedAt ?? new Date().toISOString(),
+    status: listItem.status,
+    summaryOverview: listItem.summaryOverview,
+    chunkCount: listItem.chunkCount,
+    segmentCount: listItem.segmentCount,
+    actionItemCount: listItem.actionItemCount,
+    topicCount: listItem.topicCount
   };
 }
 
