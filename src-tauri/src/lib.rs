@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod codex_models;
 pub mod exports;
 pub mod meeting;
 pub mod openai_credentials;
@@ -587,20 +588,36 @@ impl AppPaths {
     }
 }
 
+#[tauri::command]
+async fn get_codex_models(app: tauri::AppHandle) -> Result<codex_models::ModelCatalog, String> {
+    let paths = AppPaths::resolve(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.ensure()?;
+        initialize_database(&paths.database_path).map_err(|e| e.to_string())?;
+        codex_models::cached_models(&paths.database_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn refresh_codex_models(app: tauri::AppHandle) -> Result<codex_models::ModelCatalog, String> {
+    let paths = AppPaths::resolve(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        paths.ensure()?;
+        initialize_database(&paths.database_path).map_err(|e| e.to_string())?;
+        codex_models::refresh_models(&paths.database_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn validate_setting(key: &str, value: &str) -> Result<(), String> {
     let valid = match key {
         "raw_audio_retention_days" => matches!(value, "0" | "7" | "30" | "365"),
         "transcription_provider" => matches!(value, "local-whisper" | "openai-api"),
         "summary_provider" => matches!(value, "codex-cli" | "openai-api" | "local-llm"),
-        "summary_model" => matches!(
-            value,
-            "gpt-5.4"
-                | "gpt-5.4-mini"
-                | "gpt-5.5"
-                | "gpt-5.6-sol"
-                | "gpt-5.6-terra"
-                | "gpt-5.6-luna"
-        ),
+        "summary_model" => codex_models::valid_model_id(value),
         "local_transcription_model" => matches!(value, "large-v3-turbo" | "large-v3"),
         "openai_transcription_model" => matches!(
             value,
@@ -721,6 +738,8 @@ pub fn run() {
         .manage(TaskCancellationRegistry::default())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
+            get_codex_models,
+            refresh_codex_models,
             list_audio_devices,
             run_audio_spike,
             record_chunked_meeting_demo,
@@ -785,7 +804,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_generic_codex_5_6_summary_model() {
-        assert!(validate_setting("summary_model", "gpt-5.6").is_err());
+    fn accepts_new_summary_models_and_rejects_invalid_ids() {
+        assert!(validate_setting("summary_model", "gpt-6-astra").is_ok());
+        assert!(validate_setting("summary_model", "--bad argument").is_err());
     }
 }

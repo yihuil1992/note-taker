@@ -442,6 +442,13 @@ const SUMMARY_MODEL_OPTIONS: AtlasSelectOption[] = [
   { value: "gpt-5.6-terra", label: "gpt-5.6-terra" },
   { value: "gpt-5.6-luna", label: "gpt-5.6-luna" }
 ];
+type CodexModelCatalog = { models: AtlasSelectOption[]; refreshedAt: string | null };
+type CodexModelPickerState = {
+  catalog: CodexModelCatalog;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+};
 const LANGUAGE_HINT_OPTIONS: AtlasSelectOption[] = [
   { value: "zh", label: "Chinese" },
   { value: "auto", label: "Auto detect" },
@@ -482,6 +489,44 @@ function App() {
   const [atlasMode, setAtlasMode] = React.useState<AtlasMode>(readStoredAtlasMode);
   const [status, setStatus] = React.useState<AppStatus | null>(null);
   const [settings, setSettings] = React.useState<AppSettings>(defaultSettings);
+  const [codexCatalog, setCodexCatalog] = React.useState<CodexModelCatalog>({ models: SUMMARY_MODEL_OPTIONS, refreshedAt: null });
+  const [codexModelsLoading, setCodexModelsLoading] = React.useState(false);
+  const [codexModelsError, setCodexModelsError] = React.useState<string | null>(null);
+  const codexRefreshPending = React.useRef(false);
+  const codexCatalogRevision = React.useRef(0);
+  React.useEffect(() => {
+    let active = true;
+    const revision = codexCatalogRevision.current;
+    void callBackend<CodexModelCatalog>("get_codex_models").then((catalog) => {
+      if (active && revision === codexCatalogRevision.current) setCodexCatalog(catalog);
+    }).catch(() => {
+      if (active && revision === codexCatalogRevision.current) setCodexModelsError("Could not load saved models. Refresh to retry.");
+    });
+    return () => { active = false; };
+  }, []);
+
+  async function refreshCodexModels() {
+    if (codexRefreshPending.current) return;
+    codexRefreshPending.current = true;
+    codexCatalogRevision.current += 1;
+    setCodexModelsLoading(true);
+    setCodexModelsError(null);
+    try {
+      const catalog = await callBackend<CodexModelCatalog>("refresh_codex_models");
+      setCodexCatalog(catalog);
+    } catch (refreshError) {
+      setCodexModelsError(String(refreshError));
+    } finally {
+      codexRefreshPending.current = false;
+      setCodexModelsLoading(false);
+    }
+  }
+  const codexModelPicker: CodexModelPickerState = {
+    catalog: codexCatalog,
+    loading: codexModelsLoading,
+    error: codexModelsError,
+    onRefresh: () => void refreshCodexModels()
+  };
   const [devices, setDevices] = React.useState<AudioDevice[]>([]);
   const [meetings, setMeetings] = React.useState<MeetingListItem[]>([]);
   const [archivedMeetings, setArchivedMeetings] = React.useState<ArchivedMeetingListItem[]>([]);
@@ -1391,6 +1436,7 @@ function App() {
         {summaryDialogOptions && detail ? (
           <SummaryOptionsDialog
             options={summaryDialogOptions}
+            modelPicker={codexModelPicker}
             hasExistingSummary={Boolean(detail.summary)}
             onChange={(options) => setSummaryDialogOptions(options)}
             onClose={() => setSummaryDialogOptions(null)}
@@ -1597,10 +1643,9 @@ function App() {
               <span>Summary language</span>
               <AtlasSelect value={settings.summaryLanguage} options={SUMMARY_LANGUAGE_OPTIONS} onChange={(value) => void updateSetting("summary_language", value)} />
             </div>
-            <div className="field">
-              <span>Codex model</span>
-              <AtlasSelect value={settings.summaryModel} options={SUMMARY_MODEL_OPTIONS} onChange={(value) => void updateSetting("summary_model", value)} />
-            </div>
+            <CodexModelPicker value={settings.summaryModel} state={codexModelPicker} onChange={(value) => {
+              void updateSetting("summary_model", value).catch((error) => setCodexModelsError(String(error)));
+            }} />
           </section>
 
           <section className="panel glossary-panel">
@@ -1706,7 +1751,7 @@ function App() {
       <footer className="atlas-footer">
         <span className="privacy-dot" />
         <strong>{settings.transcriptionProvider === "openai-api" ? "Cloud transcription on" : "Local by default"}</strong>
-        <span className="version-pill">v{status?.appVersion ?? "0.2.9"}</span>
+        <span className="version-pill">v{status?.appVersion ?? "0.2.10"}</span>
         <span>{settings.transcriptionProvider === "openai-api" ? "Audio windows are sent to OpenAI for transcription." : "Audio and transcripts stay on this device unless you choose cloud transcription."}</span>
         <button className="ghost-action" type="button" onClick={() => void checkForUpdates(false)} disabled={updateCheckStatus === "checking"}>
           <RefreshCw size={14} aria-hidden="true" />
@@ -2283,14 +2328,45 @@ function ArchivedMeetingsDialog({
   );
 }
 
+function CodexModelPicker({ value, state, onChange }: {
+  value: string;
+  state: CodexModelPickerState;
+  onChange: (value: string) => void;
+}) {
+  const labelId = React.useId();
+  const options = state.catalog.models.some((model) => model.value === value)
+    ? state.catalog.models
+    : [{ value, label: `${value} (current selection)` }, ...state.catalog.models];
+  return (
+    <div className="field codex-model-field" role="group" aria-labelledby={labelId}>
+      <div className="panel-title-row">
+        <span id={labelId}>Codex model</span>
+        <button className="ghost-action" type="button" onClick={state.onRefresh} disabled={state.loading}
+          aria-label="Refresh Codex models" title="Fetch available models using your local Codex login">
+          <RefreshCw size={13} aria-hidden="true" />
+          {state.loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+      <AtlasSelect value={value} options={options} onChange={onChange} />
+      <small role="status" className={state.error ? "codex-model-error" : undefined}>
+        {state.error ? `${state.error} Previous list kept.` : state.loading ? "Fetching models from Codex…" : state.catalog.refreshedAt
+          ? `${state.catalog.models.length} models · Updated ${formatDateTime(state.catalog.refreshedAt)}`
+          : "Built-in list · Refresh for available models."}
+      </small>
+    </div>
+  );
+}
+
 function SummaryOptionsDialog({
   options,
+  modelPicker,
   hasExistingSummary,
   onChange,
   onClose,
   onConfirm
 }: {
   options: SummaryRunOptions;
+  modelPicker: CodexModelPickerState;
   hasExistingSummary: boolean;
   onChange: (options: SummaryRunOptions) => void;
   onClose: () => void;
@@ -2322,10 +2398,7 @@ function SummaryOptionsDialog({
         </div>
 
         <div className="summary-options-grid">
-          <label className="field">
-            <span>Codex model</span>
-            <AtlasSelect value={options.model} options={SUMMARY_MODEL_OPTIONS} onChange={(value) => update({ model: value })} />
-          </label>
+          <CodexModelPicker value={options.model} state={modelPicker} onChange={(value) => update({ model: value })} />
           <label className="field">
             <span>Summary language</span>
             <AtlasSelect value={options.language} options={SUMMARY_LANGUAGE_OPTIONS} onChange={(value) => update({ language: value })} />
@@ -3039,7 +3112,7 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   if (command === "get_app_status") {
     const sidecar = mockSidecar(mockModelVerified, mockRuntimeInstalled);
     return {
-      appVersion: "0.2.9",
+      appVersion: "0.2.10",
       appDataDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker",
       databasePath: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\note-taker.sqlite3",
       recordingsDir: "C:\\Users\\you\\AppData\\Roaming\\com.yihui.notetaker\\recordings",
@@ -3054,6 +3127,10 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
       sidecar,
       settings: mockSettings
     } as T;
+  }
+  if (command === "get_codex_models") return { models: SUMMARY_MODEL_OPTIONS, refreshedAt: null } as T;
+  if (command === "refresh_codex_models") {
+    throw new Error("Open the desktop app to refresh models using your Codex login.");
   }
   if (command === "get_app_settings") return mockSettings as T;
   if (command === "get_openai_api_key_status") return mockOpenAiApiKeyStatus as T;
@@ -3302,12 +3379,12 @@ async function mockBackend<T>(command: string, args?: Record<string, unknown>): 
   }
   if (command === "check_for_app_update") {
     return {
-      currentVersion: "0.2.9",
-      latestVersion: "v0.2.9",
+      currentVersion: "0.2.10",
+      latestVersion: "v0.2.10",
       updateAvailable: false,
       installable: false,
-      releaseName: "Note Taker v0.2.9",
-      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.9",
+      releaseName: "Note Taker v0.2.10",
+      releaseUrl: "https://github.com/yihuil1992/note-taker/releases/tag/v0.2.10",
       publishedAt: "2026-06-12T22:47:08Z",
       notes: "You are running the latest release."
     } as T;
