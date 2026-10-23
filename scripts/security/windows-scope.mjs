@@ -77,7 +77,9 @@ export function collectWindowsGraph(root, out, locked, manifest) {
   };
   const rust = run('rustc', ['-vV'], 'rust-version');
   assert(rust.split(/\r?\n/).includes(`host: ${windowsTarget}`), 'Rust host does not match Windows gate target');
-  const common = ['--locked', '--all-features', '--manifest-path', 'src-tauri/Cargo.toml'];
+  // CI toolchain setup can force CARGO_TERM_COLOR=always. Keep machine input
+  // deterministic without relaxing the strict parser or ignoring diagnostics.
+  const common = ['--color', 'never', '--locked', '--all-features', '--manifest-path', 'src-tauri/Cargo.toml'];
   const metadataArgs = ['metadata', ...common, '--format-version', '1', '--filter-platform', windowsTarget];
   const treeArgs = ['tree', ...common, '--target', windowsTarget, '--edges', 'normal,build,dev', '--prefix', 'none', '--format', '{p}'];
   fs.writeFileSync(path.join(out, 'windows-graph-commands.json'), JSON.stringify({ metadataArgs, treeArgs }, null, 2));
