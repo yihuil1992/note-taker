@@ -75,10 +75,15 @@ windows = { version = "0.58.0", features = [
   "Win32_System_Memory",
   "Win32_System_Threading"
 ] }
-zip = "2.2.2"
+zip = "=9.0.5"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-dialog = "2.3.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-updater = "2"
+# Official v2 ZIP security fix, not yet released on crates.io (upstream PR #3698).
+# Return to a released 2.x crate once it includes this fix; preserve ZIP support.
+tauri-plugin-updater = { version = "2.14.0", git = "https://github.com/tauri-apps/plugins-workspace", rev = "ba98bfadc4c868c9a7e1a226c83af528e1f11b89" }
+
+[dev-dependencies]
+tempfile = "=3.27.0"

@@ -198,3 +198,68 @@ fn safe_file_stem(title: &str) -> String {
         stem.chars().take(80).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{archive_meeting, restore_meeting};
+
+    #[test]
+    fn archived_and_restored_meetings_export_without_losing_content() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("fixture.sqlite3");
+        let exports = root.path().join("exports");
+        initialize_database(&database).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                r#"
+            INSERT INTO meetings (id, title, started_at, status)
+            VALUES ('fixture', '../Review: meeting', '2026-10-23T08:00:00Z', 'summarized');
+            INSERT INTO transcript_segments (id, meeting_id, source_kind, speaker_label,
+                language, start_ms, end_ms, text, provider)
+            VALUES ('segment', 'fixture', 'microphone', 'Speaker', 'en', 0, 1000,
+                'Isolated transcript', 'fixture');
+            INSERT INTO meeting_summaries (meeting_id, suggested_title, provider, model,
+                language, overview, decisions_json, action_items_json, topics_json,
+                risks_or_questions_json, raw_json)
+            VALUES ('fixture', 'Review', 'fixture', 'fixture', 'en', 'Summary preserved',
+                '[]', '[{"task":"Follow up"}]', '["Security"]', '[]', '{}');
+        "#,
+            )
+            .unwrap();
+        drop(connection);
+        archive_meeting(&database, "fixture").unwrap();
+        let archived = export_meeting_json(&database, &exports, "fixture").unwrap();
+        let json: Value = serde_json::from_slice(&fs::read(&archived.path).unwrap()).unwrap();
+        assert!(json["meeting"]["archivedAt"].is_string());
+        assert_eq!(json["transcriptSegments"][0]["text"], "Isolated transcript");
+        assert_eq!(Path::new(&archived.path).parent(), Some(exports.as_path()));
+        restore_meeting(&database, "fixture").unwrap();
+        let markdown = export_meeting_markdown(&database, &exports, "fixture").unwrap();
+        let text = fs::read_to_string(&markdown.path).unwrap();
+        assert!(text.contains("Summary preserved") && text.contains("Follow up"));
+        assert!(text.contains("Isolated transcript"));
+        assert_eq!(markdown.bytes, text.len() as u64);
+        assert_eq!(Path::new(&markdown.path).parent(), Some(exports.as_path()));
+        let restored = export_meeting_json(&database, &exports, "fixture").unwrap();
+        let json: Value = serde_json::from_slice(&fs::read(&restored.path).unwrap()).unwrap();
+        assert!(json["meeting"]["archivedAt"].is_null());
+    }
+
+    #[test]
+    fn missing_meeting_export_does_not_create_output() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("fixture.sqlite3");
+        let exports = root.path().join("exports");
+        assert!(matches!(
+            export_meeting_json(&database, &exports, "missing"),
+            Err(ExportError::MissingMeeting(_))
+        ));
+        assert!(matches!(
+            export_meeting_markdown(&database, &exports, "missing"),
+            Err(ExportError::MissingMeeting(_))
+        ));
+        assert!(!exports.exists());
+    }
+}
