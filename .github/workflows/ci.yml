@@ -24,7 +24,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
         with:
-          version: 9
+          version: 9.15.9
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -45,7 +45,22 @@ jobs:
         run: pnpm build
 
       - name: Check Rust workspace
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Test Rust workspace
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Regress updater ZIP handling and signatures without installing
+        run: node scripts/security/test-updater.mjs
+
+      - name: Retain updater regression evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: updater-regressions
+          path: |
+            output/updater-regressions/run-*/*.json
+            output/updater-regressions/run-*/*.log
+            output/updater-regressions/run-*/plugin/Cargo.lock
+          if-no-files-found: warn
+          retention-days: 30

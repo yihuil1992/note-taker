@@ -1,0 +1,64 @@
+name: Dependency Security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '19 8 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-security-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  osv:
+    name: Windows dependencies (full report retained)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Install scan tooling without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Test security gate failure handling
+        run: pnpm security:test
+
+      - name: Setup Rust for Windows graph resolution
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - name: Scan all dependencies and gate Windows, npm and pinned Git sources
+        run: pnpm security:windows output/security/ci
+
+      - name: Retain full scan evidence on success or failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: osv-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            output/security/ci/*.json
+            output/security/ci/*.log
+            output/security/ci/*.txt
+            output/security/ci/*.toml
+            output/security/ci/*.md
+          if-no-files-found: error
+          retention-days: 30

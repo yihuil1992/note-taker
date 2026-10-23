@@ -624,11 +624,24 @@ fn extract_zip(archive_path: &Path, destination_dir: &Path) -> Result<(), Sideca
     let mut archive = ZipArchive::new(archive_file)?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
+        let file_name = file.name()?.into_owned();
+        // zip 9 normalizes leading roots/prefixes in enclosed_name. Runtime
+        // bundles must contain relative Windows paths, never drive paths/ADS.
+        if file_name.starts_with(['/', '\\']) || file_name.contains(':') {
+            return Err(SidecarError::InvalidArchive(format!(
+                "Unsafe archive path: {file_name}"
+            )));
+        }
+        if file.is_symlink() {
+            return Err(SidecarError::InvalidArchive(format!(
+                "Symbolic links are not allowed in runtime archives: {file_name}"
+            )));
+        }
         if file.is_dir() {
             continue;
         }
         let enclosed_name = file.enclosed_name().ok_or_else(|| {
-            SidecarError::InvalidArchive(format!("Unsafe archive path: {}", file.name()))
+            SidecarError::InvalidArchive(format!("Unsafe archive path: {file_name}"))
         })?;
         let output_path = destination_dir.join(enclosed_name);
         if let Some(parent) = output_path.parent() {
@@ -789,6 +802,75 @@ fn executable_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_archive(root: &Path, name: &str, symlink: bool) -> PathBuf {
+        let path = root.join("runtime.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        if symlink {
+            writer.add_symlink(name, "../outside.txt", options).unwrap();
+        } else {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(b"isolated runtime fixture").unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn runtime_zip_extracts_nested_deflated_files() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = runtime_archive(root.path(), "bin/whisper-cli.exe", false);
+        let output = root.path().join("extracted");
+        extract_zip(&archive, &output).unwrap();
+        assert_eq!(
+            fs::read(output.join("bin/whisper-cli.exe")).unwrap(),
+            b"isolated runtime fixture"
+        );
+    }
+
+    #[test]
+    fn runtime_zip_rejects_traversal_and_absolute_paths() {
+        for name in [
+            "../outside.txt",
+            "..\\outside.txt",
+            "/outside.txt",
+            "C:\\outside.txt",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let sentinel = root.path().join("outside.txt");
+            fs::write(&sentinel, b"unchanged").unwrap();
+            let archive = runtime_archive(root.path(), name, false);
+            assert!(
+                extract_zip(&archive, &root.path().join("extracted")).is_err(),
+                "accepted {name}"
+            );
+            assert_eq!(fs::read(sentinel).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn runtime_zip_rejects_external_symlinks_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = runtime_archive(root.path(), "link.exe", true);
+        let output = root.path().join("extracted");
+        assert!(matches!(
+            extract_zip(&archive, &output),
+            Err(SidecarError::InvalidArchive(_))
+        ));
+        assert!(!output.join("link.exe").exists());
+    }
+
+    #[test]
+    fn runtime_zip_rejects_truncated_archives() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = runtime_archive(root.path(), "whisper-cli.exe", false);
+        let mut bytes = fs::read(&archive).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        fs::write(&archive, bytes).unwrap();
+        assert!(extract_zip(&archive, &root.path().join("extracted")).is_err());
+    }
 
     #[test]
     fn extract_transcript_text_collects_nested_text_fields() {

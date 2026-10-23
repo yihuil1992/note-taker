@@ -3,7 +3,11 @@
   "private": true,
   "version": "0.2.10",
   "type": "module",
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
+    "security:scan": "node scripts/security/scan.mjs",
+    "security:windows": "node scripts/security/scan.mjs --windows",
+    "security:test": "node --test scripts/security/scan.test.mjs scripts/security/windows-scope.test.mjs",
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
@@ -23,8 +27,8 @@
     "transcribe:smoke": "cargo run --manifest-path src-tauri/Cargo.toml --bin transcribe-smoke --"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.2.0",
-    "@tauri-apps/plugin-dialog": "~2.7.1",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-dialog": "~2.7.3",
     "@tauri-apps/plugin-notification": "~2.3.3",
     "@tauri-apps/plugin-process": "~2.3.1",
     "@tauri-apps/plugin-updater": "~2.10.1",
@@ -33,12 +37,14 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.2.0",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
-    "playwright": "^1.60.0",
-    "typescript": "^5.6.3",
-    "vite": "^6.0.3"
+    "@tauri-apps/cli": "^2.12.4",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "playwright": "^1.64.1",
+    "smol-toml": "1.9.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.5",
+    "yaml": "2.9.1"
   }
 }
