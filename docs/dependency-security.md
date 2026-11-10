@@ -46,7 +46,30 @@ workspaces or source types need explicit coverage support before they pass.
 The normal Windows CI also runs Cargo check/test with `--locked` so manifests
 cannot silently resolve a different Rust graph.
 
-## Remediation status as of 2026-10-23
+## Remediation update: 2026-11-10
+
+The candidate keeps the existing Windows normal/build/dev + all npm gate unchanged.
+SQLite is upgraded via rusqlite 0.41.0 to bundled SQLite 3.54.1. Compatible
+registry updates remediate the remaining supported dependency chains while
+retaining React 18, Vite 6 and Tauri 2. Tauri now requires Rust 1.90 or newer.
+The official released updater 2.14.1 replaces the temporary Git pin and retains
+ZIP 9, Rustls, system proxy and cryptographic signature verification. The
+updater regression harness verifies the official .crate archive against the
+committed Cargo.lock checksum, extracts a disposable copy, and retains the
+existing archive/signature tests and installation guard. The previous Git-pin
+support remains fail-closed in the scanner; the current lock has no Git source.
+
+SQLite regression tests use only synthetic databases and cover the patched
+runtime version, initialization, legacy migration, settings, search, archive
+and restore. Existing ZIP path, symlink and export protections from PR #17 are
+preserved. Full cross-platform reports still include the GTK-chain glib and
+proc-macro-error advisories; they are outside the actual Windows graph and no
+advisory ignore list is added.
+
+The following October record describes the previous baseline and temporary Git
+pin, not the current dependency set.
+
+## Historical remediation status as of 2026-10-23
 
 Compatible updates retain React 18, Vite 6 and Tauri 2. The original full
 baseline contained 44 unique advisory groups across 29 package versions

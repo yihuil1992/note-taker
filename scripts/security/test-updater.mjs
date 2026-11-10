@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'smol-toml';
-import { updaterPin, updaterSource, sha256 } from './scan.mjs';
+import { sha256 } from './scan.mjs';
 
 assert.equal(process.platform, 'win32', 'Updater archive regressions require Windows');
 const root = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
@@ -16,7 +16,9 @@ const out = fs.mkdtempSync(path.join(base, 'run-'));
 const fixture = path.join(out, 'plugin');
 const temp = path.join(out, 'temp');
 fs.mkdirSync(temp);
-const evidence = { startedAt: new Date().toISOString(), pin: updaterPin, status: 'error' };
+const registrySource = 'registry+https://github.com/rust-lang/crates.io-index';
+const updaterVersion = '2.14.1';
+const evidence = { startedAt: new Date().toISOString(), version: updaterVersion, status: 'error' };
 const run = (args, name, cwd = root) => {
   const result = spawnSync('cargo', args, { cwd, encoding: 'utf8', timeout: 1200000,
     maxBuffer: 64 * 1024 * 1024,
@@ -29,30 +31,24 @@ const run = (args, name, cwd = root) => {
 console.log(`Updater fixture reports: ${out}`);
 try {
   const metadata = JSON.parse(run(['metadata', '--locked', '--format-version', '1', '--manifest-path', 'src-tauri/Cargo.toml'], 'application-metadata'));
-  const pkg = metadata.packages.find(p => p.name === updaterPin.name && p.source === updaterSource);
-  assert(pkg && pkg.version === updaterPin.version, 'Expected official updater pin');
-  const source = path.dirname(pkg.manifest_path), workspace = path.resolve(source, '../..');
-  const original = fs.readFileSync(path.join(source, 'src/updater.rs'), 'utf8');
-  const git = spawnSync('git', ['show', `${updaterPin.rev}:plugins/updater/src/updater.rs`], { cwd: workspace, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
-  assert(git.status === 0 && original.replaceAll('\r\n', '\n') === git.stdout.replaceAll('\r\n', '\n'), 'Updater source differs from pinned Git revision');
+  const matches = metadata.packages.filter(p => p.name === 'tauri-plugin-updater');
+  assert.equal(matches.length, 1, 'Expected one updater dependency');
+  const pkg = matches[0];
+  assert(pkg.version === updaterVersion && pkg.source === registrySource, 'Expected official released updater');
+  const source = path.dirname(pkg.manifest_path);
+  const locked = parse(fs.readFileSync(path.join(root, 'src-tauri/Cargo.lock'), 'utf8')).package
+    .filter(p => p.name === pkg.name && p.version === pkg.version && p.source === registrySource);
+  assert.equal(locked.length, 1, 'Updater missing from lockfile');
+  const archive = path.resolve(source, '../../../cache', path.basename(path.dirname(source)), pkg.name + '-' + pkg.version + '.crate');
+  assert(/^[a-f0-9]{64}$/.test(locked[0].checksum), 'Missing registry checksum');
+  assert.equal(sha256(fs.readFileSync(archive)), locked[0].checksum, 'Registry archive checksum differs from lock');
+  evidence.registryChecksum = locked[0].checksum;
+  fs.mkdirSync(fixture);
+  const extracted = spawnSync('tar', ['-xzf', archive, '--strip-components=1', '-C', fixture], { encoding: 'utf8' });
+  assert(extracted.status === 0, 'Cannot extract verified registry archive: ' + extracted.stderr);
+  const original = fs.readFileSync(path.join(fixture, 'src/updater.rs'), 'utf8');
   evidence.updaterSourceSha256 = sha256(original);
-  fs.cpSync(source, fixture, { recursive: true });
-  const manifest = parse(fs.readFileSync(pkg.manifest_path, 'utf8'));
-  const shared = parse(fs.readFileSync(path.join(workspace, 'Cargo.toml'), 'utf8')).workspace;
-  for (const [key, value] of Object.entries(manifest.package)) {
-    if (value?.workspace) { assert(shared.package[key] !== undefined); manifest.package[key] = shared.package[key]; }
-  }
-  for (const table of [manifest, ...Object.values(manifest.target ?? {})]) {
-    for (const kind of ['dependencies', 'dev-dependencies', 'build-dependencies']) {
-      for (const [name, value] of Object.entries(table[kind] ?? {})) {
-        if (!value.workspace) continue;
-        let inherited = shared.dependencies[name]; assert(inherited, `Missing workspace dependency ${name}`);
-        if (typeof inherited === 'string') inherited = { version: inherited };
-        const merged = { ...inherited, ...value, features: [...new Set([...(inherited.features ?? []), ...(value.features ?? [])])] };
-        delete merged.workspace; table[kind][name] = merged;
-      }
-    }
-  }
+  const manifest = parse(fs.readFileSync(path.join(fixture, 'Cargo.toml'), 'utf8'));
   // Match the app's unified ZIP default features, including Deflate.
   manifest['dev-dependencies'].zip = '=9.0.5';
   // A local root's lock resolves every declared feature. The application uses
