@@ -1,6 +1,7 @@
 use crate::storage::{initialize_database, reset_meeting_transcription};
-use chrono::Utc;
+use crate::wall_clock::utc_run_prefix;
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::fs;
@@ -230,7 +231,7 @@ fn output_directory(
     chunk_seconds: u32,
 ) -> Result<PathBuf, RechunkError> {
     let app_data_dir = database_path.parent().unwrap_or_else(|| Path::new("."));
-    let run_id = format!("{}-{}", Utc::now().format("%Y%m%d%H%M%S"), Uuid::new_v4());
+    let run_id = format!("{}-{}", utc_run_prefix(Timestamp::now()), Uuid::new_v4());
     Ok(app_data_dir
         .join("recordings")
         .join(meeting_id)

@@ -7,7 +7,8 @@ use crate::storage::{
     NewMeeting, NewTranscriptSegment, TranscriptSegmentRecord,
 };
 use crate::task_control::CancellationToken;
-use chrono::{DateTime, Local, Utc};
+use crate::wall_clock::{local_meeting_title, utc_rfc3339};
+use jiff::Timestamp;
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
@@ -124,9 +125,8 @@ pub fn record_chunked_demo(
     let requested_seconds = requested_seconds.clamp(6, 14_400);
     let chunk_seconds = chunk_seconds.clamp(3, 60).min(requested_seconds);
     let meeting_id = uuid::Uuid::new_v4().to_string();
-    let started_at = Utc::now();
-    let local_started: DateTime<Local> = DateTime::from(started_at);
-    let title = format!("Meeting {}", local_started.format("%Y-%m-%d %H:%M"));
+    let started_at = Timestamp::now();
+    let title = local_meeting_title(started_at);
     let meeting_dir = recordings_dir.join(&meeting_id);
     fs::create_dir_all(&meeting_dir)?;
 
@@ -136,7 +136,7 @@ pub fn record_chunked_demo(
             id: &meeting_id,
             title: &title,
             title_source: "datetime_placeholder",
-            started_at: &started_at.to_rfc3339(),
+            started_at: &utc_rfc3339(started_at),
             status: "recording",
             language_hint: "auto",
             summary_language: "auto",
@@ -172,19 +172,19 @@ pub fn record_chunked_demo(
         offset_seconds += seconds;
     }
 
-    let ended_at = Utc::now();
+    let ended_at = Timestamp::now();
     finish_meeting(
         database_path,
         &meeting_id,
-        &ended_at.to_rfc3339(),
+        &utc_rfc3339(ended_at),
         "recorded",
     )?;
 
     Ok(ChunkedMeetingResult {
         meeting_id,
         title,
-        started_at: started_at.to_rfc3339(),
-        ended_at: ended_at.to_rfc3339(),
+        started_at: utc_rfc3339(started_at),
+        ended_at: utc_rfc3339(ended_at),
         status: "recorded".to_string(),
         chunk_seconds,
         requested_seconds,

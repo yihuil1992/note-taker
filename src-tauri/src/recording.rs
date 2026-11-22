@@ -1,7 +1,8 @@
 use crate::audio::capture_spike;
 use crate::meeting::{persist_source_and_chunk, RecordedChunk};
 use crate::storage::{finish_meeting, initialize_database, insert_meeting, NewMeeting};
-use chrono::{DateTime, Local, Utc};
+use crate::wall_clock::{local_meeting_title, utc_rfc3339};
+use jiff::Timestamp;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -89,9 +90,9 @@ impl RecordingManager {
         let requested_seconds = requested_seconds.clamp(6, 14_400);
         let chunk_seconds = chunk_seconds.clamp(3, 60).min(requested_seconds);
         let meeting_id = uuid::Uuid::new_v4().to_string();
-        let started_at = Utc::now();
-        let local_started: DateTime<Local> = DateTime::from(started_at);
-        let title = format!("Meeting {}", local_started.format("%Y-%m-%d %H:%M"));
+        let started = Timestamp::now();
+        let title = local_meeting_title(started);
+        let started_at = utc_rfc3339(started);
         let meeting_dir = recordings_dir.join(&meeting_id);
         fs::create_dir_all(&meeting_dir)?;
 
@@ -101,7 +102,7 @@ impl RecordingManager {
                 id: &meeting_id,
                 title: &title,
                 title_source: "datetime_placeholder",
-                started_at: &started_at.to_rfc3339(),
+                started_at: &started_at,
                 status: "recording",
                 language_hint: "auto",
                 summary_language: "auto",
@@ -114,7 +115,7 @@ impl RecordingManager {
         let worker_chunks = Arc::clone(&captured_chunks);
         let worker_meeting_id = meeting_id.clone();
         let worker_title = title.clone();
-        let worker_started_at = started_at.to_rfc3339();
+        let worker_started_at = started_at.clone();
         let handle = thread::spawn(move || {
             run_recording_worker(
                 database_path,
@@ -132,7 +133,7 @@ impl RecordingManager {
         let status = ActiveRecordingStatus {
             meeting_id: meeting_id.clone(),
             title: title.clone(),
-            started_at: started_at.to_rfc3339(),
+            started_at: started_at.clone(),
             chunk_seconds,
             captured_chunks: 0,
             stop_requested: false,
@@ -141,7 +142,7 @@ impl RecordingManager {
         *guard = Some(ActiveRecording {
             meeting_id,
             title,
-            started_at: started_at.to_rfc3339(),
+            started_at,
             chunk_seconds,
             stop_requested,
             captured_chunks,
@@ -252,7 +253,7 @@ fn run_recording_worker(
         offset_seconds += seconds;
     }
 
-    let ended_at = Utc::now().to_rfc3339();
+    let ended_at = utc_rfc3339(Timestamp::now());
     finish_meeting(&database_path, &meeting_id, &ended_at, "recorded")?;
     Ok(RecordingStopResult {
         meeting_id,
