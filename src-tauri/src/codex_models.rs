@@ -1,4 +1,6 @@
 //! Discover summary models through the same local CLI used for summaries.
+use crate::wall_clock::utc_rfc3339;
+use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -73,7 +75,7 @@ pub fn refresh_models(database: &Path) -> Result<ModelCatalog, String> {
     let models = discover_models()?;
     let catalog = ModelCatalog {
         models,
-        refreshed_at: Some(chrono::Utc::now().to_rfc3339()),
+        refreshed_at: Some(utc_rfc3339(Timestamp::now())),
     };
     crate::storage::set_app_setting(
         database,

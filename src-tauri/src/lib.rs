@@ -14,6 +14,7 @@ pub mod summary;
 pub mod task_control;
 pub mod text_normalization;
 pub mod updates;
+mod wall_clock;
 
 use audio::{capture_spike, list_devices, AudioDevice, SpikeResult};
 use exports::{export_meeting_json, export_meeting_markdown, ExportResult};
